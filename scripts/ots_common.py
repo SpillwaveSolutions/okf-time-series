@@ -8,10 +8,13 @@ Identity: session `agent` resolves to an existing AgentIdentity (second-brain-co
 This plugin does not define a new identity type.
 
 Bundle root: SECOND_BRAIN_ROOT. Never hard-code a private remote.
+
+Walk and rollup are index-free: they read the filesystem, not BM25/vector/graph.
 """
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import os
 import re
@@ -41,6 +44,7 @@ PERIOD_MONTH = re.compile(r"^\d{4}-\d{2}$")
 PERIOD_WEEK = re.compile(r"^(\d{4})-W(\d{2})$")
 PERIOD_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PERIOD_HOUR = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2})$")
+ARTIFACT_SUFFIXES = (".telemetry.md", ".summary.md", ".saliency.md")
 
 # Crockford base32, no I L O U. 26 chars = 10-byte timestamp + 16-byte entropy, ULID-shaped.
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -262,6 +266,82 @@ def cmd_path_for(args) -> int:
     return 0
 
 
+def _rel_between(parent: Path, child: Path) -> str:
+    return Path(os.path.relpath(child, start=parent.parent)).as_posix()
+
+
+def _append_aggregate(parent_file: Path, child_file: Path) -> bool:
+    """Add child to parent aggregates if missing. Does not invent summary prose."""
+    if not parent_file.exists():
+        return False
+    meta, body = parse_frontmatter(parent_file.read_text(encoding="utf-8"))
+    rel = _rel_between(parent_file, child_file)
+    aggs = list(meta.get("aggregates") or [])
+    if rel in aggs:
+        return False
+    aggs.append(rel)
+    meta["aggregates"] = aggs
+    write_md(parent_file, meta, body)
+    return True
+
+
+def _blank_aggregate_body(title: str) -> str:
+    return f"# {title}\n\n## Summary\n\n(proposed)\n\n## Saliency\n\n- (proposed)\n"
+
+
+def ensure_spine(bundle: Path, hour_period: str, author: str) -> list[str]:
+    """Create missing Year→Month→Week→Day→Hour files and wire aggregates.
+
+    Eager Hour nodes, as illustrated on #72 — not a vote on the threshold question.
+    Does not write summary or saliency prose.
+    """
+    m = PERIOD_HOUR.match(hour_period)
+    if not m:
+        raise ValueError(f"invalid hour period: {hour_period}")
+    day = m.group(1)
+    year_s, month_s, _ = day.split("-")
+    d = date.fromisoformat(day)
+    iso = d.isocalendar()
+    week_period = f"{iso.year}-W{iso.week:02d}"
+    last = calendar.monthrange(int(year_s), int(month_s))[1]
+    specs = [
+        ("year", year_s, f"{year_s}-01-01", f"{year_s}-12-31", year_s),
+        ("month", f"{year_s}-{month_s}", f"{year_s}-{month_s}-01", f"{year_s}-{month_s}-{last:02d}", f"{year_s}-{month_s}"),
+        ("week", week_period, *iso_week_range(week_period), week_period),
+        ("day", day, day, day, day),
+        ("hour", hour_period, day, day, hour_period),
+    ]
+    created: list[str] = []
+    files: dict[str, Path] = {}
+    for kind, period, start, end, title in specs:
+        rel = path_for(period, kind)
+        dest = bundle / rel
+        files[kind] = dest
+        if dest.exists():
+            continue
+        write_md(
+            dest,
+            {
+                "type": f"temporal.{kind}",
+                "title": title,
+                "period": period,
+                "start_date": start,
+                "end_date": end,
+                "status": "open",
+                "timestamp": now_iso(),
+                "author": author,
+                "aggregates": [],
+            },
+            _blank_aggregate_body(title),
+        )
+        created.append(rel.as_posix())
+    _append_aggregate(files["year"], files["month"])
+    _append_aggregate(files["month"], files["week"])
+    _append_aggregate(files["week"], files["day"])
+    _append_aggregate(files["day"], files["hour"])
+    return created
+
+
 def cmd_write_aggregate(args) -> int:
     author = resolve_author(args.author)
     kind = args.kind
@@ -296,7 +376,7 @@ def cmd_write_aggregate(args) -> int:
     if errors and not args.allow_dangling:
         print(json.dumps({"error": "dangling aggregates", "errors": errors}))
         return 1
-    body = args.body or f"# {meta['title']}\n\n## Summary\n\n(proposed)\n\n## Saliency\n\n- (proposed)\n"
+    body = args.body or _blank_aggregate_body(meta["title"])
     write_md(dest, meta, body)
     print(json.dumps({"ok": True, "path": str(dest), "author": author}))
     return 0
@@ -320,6 +400,9 @@ def cmd_write_session(args) -> int:
         print(json.dumps({"error": "agent name and role required — they resolve to AgentIdentity, they do not define one"}))
         return 1
     bundle = resolve_bundle(args.bundle)
+    created: list[str] = []
+    if args.ensure_spine:
+        created = ensure_spine(bundle, args.period, author)
     rel = path_for(args.period, "session", slug)
     dest = bundle / rel
     parent = f"../{path_for(args.period, 'hour').name}"
@@ -353,8 +436,12 @@ def cmd_write_session(args) -> int:
     if segs:
         meta["segments"] = segs
     body = args.body or f"# {args.title or slug}\n"
+    if args.title:
+        meta["title"] = args.title
     write_md(dest, meta, body)
-    print(json.dumps({"ok": True, "path": str(dest), "ulid": sid, "author": author}))
+    hour_file = bundle / path_for(args.period, "hour")
+    linked = _append_aggregate(hour_file, dest) if hour_file.exists() else False
+    print(json.dumps({"ok": True, "path": str(dest), "ulid": sid, "author": author, "spine": created, "hour_linked": linked}))
     return 0
 
 
@@ -395,6 +482,199 @@ def iter_nodes(bundle: Path):
         meta, body = parse_frontmatter(text)
         rel = "/" + str(p.relative_to(bundle)).replace("\\", "/")
         yield {"path": rel, "file": p, "meta": meta, "body": body}
+
+
+def _is_session_artifact(name: str) -> bool:
+    return name.endswith(ARTIFACT_SUFFIXES)
+
+
+def _record(path: Path, bundle: Path) -> dict | None:
+    if not path.exists() or not path.is_file():
+        return None
+    meta, body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    typ = meta.get("type", "")
+    rec = {
+        "kind": OWNED_TYPES.get(typ, typ),
+        "type": typ,
+        "title": meta.get("title", path.stem),
+        "period": meta.get("period", ""),
+        "status": meta.get("status", ""),
+        "path": "/" + str(path.relative_to(bundle)).replace("\\", "/"),
+        "aggregates": meta.get("aggregates") or [],
+        "author": meta.get("author", ""),
+    }
+    if typ == "temporal.session":
+        rec["id"] = meta.get("id")
+        rec["ulid"] = meta.get("ulid")
+        rec["agent"] = meta.get("agent") or {}
+        rec["close_reason"] = meta.get("close_reason")
+        rec["started_at"] = meta.get("started_at")
+        rec["ended_at"] = meta.get("ended_at")
+        rec["parent"] = meta.get("parent")
+    rec["excerpt"] = " ".join(body.split())[:240]
+    return rec
+
+
+def walk_tree(bundle: Path) -> list[dict]:
+    """Index-free chronological walk. Directories are the index."""
+    root = bundle / "okf" / "temporal"
+    years: list[dict] = []
+    if not root.exists():
+        return years
+    for ydir in sorted((p for p in root.iterdir() if p.is_dir()), key=lambda p: p.name):
+        year = _record(ydir / f"{ydir.name}.md", bundle) or {
+            "kind": "year",
+            "period": ydir.name,
+            "path": f"/okf/temporal/{ydir.name}/{ydir.name}.md",
+            "missing": True,
+        }
+        year["children"] = []
+        for mdir in sorted((p for p in ydir.iterdir() if p.is_dir() and p.name.isdigit()), key=lambda p: p.name):
+            month_md = mdir / f"{ydir.name}-{mdir.name}.md"
+            month = _record(month_md, bundle) or {
+                "kind": "month",
+                "period": f"{ydir.name}-{mdir.name}",
+                "path": f"/okf/temporal/{ydir.name}/{mdir.name}/{ydir.name}-{mdir.name}.md",
+                "missing": True,
+            }
+            month["weeks"] = []
+            month["days"] = []
+            for sub in sorted((p for p in mdir.iterdir() if p.is_dir()), key=lambda p: p.name):
+                if sub.name.startswith("W"):
+                    week_md = sub / f"{ydir.name}-{sub.name}.md"
+                    week = _record(week_md, bundle) or {
+                        "kind": "week",
+                        "period": f"{ydir.name}-{sub.name}",
+                        "path": f"/okf/temporal/{ydir.name}/{mdir.name}/{sub.name}/{ydir.name}-{sub.name}.md",
+                        "missing": True,
+                    }
+                    month["weeks"].append(week)
+                    continue
+                if not (sub.name.isdigit() and len(sub.name) == 2):
+                    continue
+                day_period = f"{ydir.name}-{mdir.name}-{sub.name}"
+                day = _record(sub / f"{day_period}.md", bundle) or {
+                    "kind": "day",
+                    "period": day_period,
+                    "path": f"/okf/temporal/{ydir.name}/{mdir.name}/{sub.name}/{day_period}.md",
+                    "missing": True,
+                }
+                day["hours"] = []
+                for hdir in sorted((p for p in sub.iterdir() if p.is_dir() and p.name.isdigit()), key=lambda p: p.name):
+                    hour_period = f"{day_period}T{hdir.name}"
+                    hour = _record(hdir / f"{hour_period}.md", bundle) or {
+                        "kind": "hour",
+                        "period": hour_period,
+                        "path": f"/okf/temporal/{ydir.name}/{mdir.name}/{sub.name}/{hdir.name}/{hour_period}.md",
+                        "missing": True,
+                    }
+                    hour["sessions"] = []
+                    sdir = hdir / "sessions"
+                    if sdir.exists():
+                        for smd in sorted(sdir.glob("*.md")):
+                            if _is_session_artifact(smd.name):
+                                continue
+                            rec = _record(smd, bundle)
+                            if rec:
+                                hour["sessions"].append(rec)
+                    day["hours"].append(hour)
+                month["days"].append(day)
+            year["children"].append(month)
+        years.append(year)
+    return years
+
+
+def flatten_walk(tree: list[dict]) -> list[dict]:
+    out: list[dict] = []
+
+    def take(node: dict, skip_keys: tuple[str, ...]) -> dict:
+        return {k: v for k, v in node.items() if k not in skip_keys}
+
+    for year in tree:
+        out.append(take(year, ("children",)))
+        for month in year.get("children") or []:
+            out.append(take(month, ("weeks", "days")))
+            for week in month.get("weeks") or []:
+                out.append(take(week, ()))
+            for day in month.get("days") or []:
+                out.append(take(day, ("hours",)))
+                for hour in day.get("hours") or []:
+                    out.append(take(hour, ("sessions",)))
+                    for session in hour.get("sessions") or []:
+                        out.append(session)
+    return out
+
+
+def cmd_walk(args) -> int:
+    bundle = Path(args.bundle or os.environ.get("SECOND_BRAIN_ROOT") or "knowledge")
+    tree = walk_tree(bundle)
+    if args.flat:
+        nodes = flatten_walk(tree)
+        if args.kind:
+            nodes = [n for n in nodes if n.get("kind") == args.kind]
+        print(json.dumps({"ok": True, "engine": "filesystem", "nodes": nodes}, indent=2))
+        return 0
+    print(json.dumps({"ok": True, "engine": "filesystem", "tree": tree}, indent=2))
+    return 0
+
+
+def cmd_rollup(args) -> int:
+    """Attach existing children to parent aggregates. No prose. Model proposes summaries separately."""
+    author = resolve_author(args.author)
+    bundle = resolve_bundle(args.bundle)
+    kind = args.kind
+    period = args.period
+    parent = bundle / path_for(period, kind)
+    if not parent.exists():
+        print(json.dumps({"error": "parent node missing", "path": str(parent), "hint": "write-session --ensure-spine or write-aggregate first"}))
+        return 1
+    linked: list[str] = []
+    if kind == "hour":
+        sdir = parent.parent / "sessions"
+        if sdir.exists():
+            for smd in sorted(sdir.glob("*.md")):
+                if _is_session_artifact(smd.name):
+                    continue
+                if _append_aggregate(parent, smd):
+                    linked.append(smd.name)
+    elif kind == "day":
+        for hdir in sorted(p for p in parent.parent.iterdir() if p.is_dir() and p.name.isdigit()):
+            hour_md = hdir / f"{period}T{hdir.name}.md"
+            if hour_md.exists() and _append_aggregate(parent, hour_md):
+                linked.append(hour_md.name)
+    elif kind == "week":
+        start, end = iso_week_range(period)
+        cur = date.fromisoformat(start)
+        last = date.fromisoformat(end)
+        while cur <= last:
+            day_rel = path_for(cur.isoformat(), "day")
+            day_file = bundle / day_rel
+            if day_file.exists() and _append_aggregate(parent, day_file):
+                linked.append(day_rel.as_posix())
+            cur += timedelta(days=1)
+    elif kind == "month":
+        year, month = period.split("-")
+        mdir = parent.parent
+        for sub in sorted(p for p in mdir.iterdir() if p.is_dir()):
+            if sub.name.startswith("W"):
+                week_md = sub / f"{year}-{sub.name}.md"
+                if week_md.exists() and _append_aggregate(parent, week_md):
+                    linked.append(week_md.name)
+    elif kind == "year":
+        ydir = parent.parent
+        for mdir in sorted(p for p in ydir.iterdir() if p.is_dir() and p.name.isdigit()):
+            month_md = mdir / f"{period}-{mdir.name}.md"
+            if month_md.exists() and _append_aggregate(parent, month_md):
+                linked.append(month_md.name)
+    else:
+        print(json.dumps({"error": f"rollup not defined for {kind}"}))
+        return 1
+    meta, body = parse_frontmatter(parent.read_text(encoding="utf-8"))
+    meta["author"] = author
+    meta["timestamp"] = now_iso()
+    write_md(parent, meta, body)
+    print(json.dumps({"ok": True, "path": str(parent), "linked": linked, "prose": "unchanged"}))
+    return 0
 
 
 def cmd_validate(args) -> int:
@@ -489,6 +769,8 @@ def main() -> int:
     s.add_argument("--saliency", default="")
     s.add_argument("--body", default="")
     s.add_argument("--author", default="")
+    s.add_argument("--ensure-spine", dest="ensure_spine", action="store_true", default=True)
+    s.add_argument("--no-ensure-spine", dest="ensure_spine", action="store_false")
 
     a = sub.add_parser("write-artifact")
     a.add_argument("--bundle", default="")
@@ -497,6 +779,17 @@ def main() -> int:
     a.add_argument("--n", default="")
     a.add_argument("--body", default="")
     a.add_argument("--author", default="")
+
+    wk = sub.add_parser("walk")
+    wk.add_argument("--bundle", default="")
+    wk.add_argument("--flat", action="store_true")
+    wk.add_argument("--kind", default="")
+
+    ru = sub.add_parser("rollup")
+    ru.add_argument("--bundle", default="")
+    ru.add_argument("--kind", required=True, choices=["year", "month", "week", "day", "hour"])
+    ru.add_argument("--period", required=True)
+    ru.add_argument("--author", default="")
 
     v = sub.add_parser("validate")
     v.add_argument("--bundle", default="")
@@ -508,6 +801,8 @@ def main() -> int:
         "write-aggregate": cmd_write_aggregate,
         "write-session": cmd_write_session,
         "write-artifact": cmd_write_artifact,
+        "walk": cmd_walk,
+        "rollup": cmd_rollup,
         "validate": cmd_validate,
     }[args.cmd]
     return fn(args)

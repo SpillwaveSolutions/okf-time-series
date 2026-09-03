@@ -1,8 +1,8 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "okf-time-series",
-  "version": "0.1.0",
-  "description": "Chronological spine for agent memory: Session \u2192 Hour \u2192 Day \u2192 Week \u2192 Month \u2192 Year. Git-native OKF plugin.",
+  "version": "0.1.1",
+  "description": "Chronological spine for agent memory: Session → Hour → Day → Week → Month → Year. Git-native OKF plugin.",
   "author": {
     "name": "Rick Hightower",
     "url": "https://github.com/RichardHightower"

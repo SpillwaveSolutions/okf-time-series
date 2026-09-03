@@ -1,1 +1,5 @@
-Fail on unowned types, dangling aggregates, invalid close_reason/status, or a session whose agent block is missing.
+---
+description: Validate temporal nodes
+---
+
+Run the `ots-validate` skill. Follow its process exactly. Use deterministic scripts; do not invent schema fields.

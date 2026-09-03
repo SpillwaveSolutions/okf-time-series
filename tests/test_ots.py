@@ -147,6 +147,84 @@ class TestOts(unittest.TestCase):
         r = run(["validate", "--bundle", str(sample)])
         self.assertEqual(r.returncode, 0, r.stdout)
 
+    def test_walk_sample_is_index_free_and_finds_sessions(self):
+        sample = ROOT / "sample-knowledge"
+        r = run(["walk", "--flat", "--bundle", str(sample)])
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["engine"], "filesystem")
+        sessions = [n for n in data["nodes"] if n.get("kind") == "session"]
+        ids = {n["id"] for n in sessions}
+        self.assertEqual(
+            ids,
+            {
+                "software_engineer__atlas__001",
+                "software_engineer__atlas__002",
+                "research__lumen__001",
+            },
+        )
+
+    def test_write_session_ensure_spine_creates_parents(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        r = run(
+            [
+                "write-session",
+                "--id",
+                "software_engineer__atlas__003",
+                "--period",
+                "2026-08-21T16",
+                "--agent-name",
+                "atlas",
+                "--agent-role",
+                "software_engineer",
+                "--title",
+                "Ensure spine",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["ok"])
+        self.assertTrue(any("2026.md" in p for p in data["spine"]))
+        hour = Path(self.bundle) / "okf/temporal/2026/08/21/16/2026-08-21T16.md"
+        self.assertTrue(hour.exists())
+        session = Path(self.bundle) / "okf/temporal/2026/08/21/16/sessions/software_engineer__atlas__003.md"
+        self.assertTrue(session.exists())
+        hour_meta = hour.read_text(encoding="utf-8")
+        self.assertIn("software_engineer__atlas__003.md", hour_meta)
+        v = run(["validate", "--bundle", self.bundle])
+        self.assertEqual(v.returncode, 0, v.stdout)
+
+    def test_rollup_hour_links_sessions_without_rewriting_prose(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        b = self.bundle
+        run(
+            [
+                "write-session",
+                "--id",
+                "research__lumen__002",
+                "--period",
+                "2026-08-22T09",
+                "--agent-name",
+                "lumen",
+                "--agent-role",
+                "research",
+                "--bundle",
+                b,
+                *author,
+            ]
+        )
+        hour = Path(b) / "okf/temporal/2026/08/22/09/2026-08-22T09.md"
+        original = hour.read_text(encoding="utf-8")
+        r = run(["rollup", "--kind", "hour", "--period", "2026-08-22T09", "--bundle", b, *author])
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["prose"], "unchanged")
+        self.assertIn("(proposed)", hour.read_text(encoding="utf-8"))
+        self.assertIn("## Summary", original)
+
 
 if __name__ == "__main__":
     unittest.main()

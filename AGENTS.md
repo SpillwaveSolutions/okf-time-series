@@ -18,4 +18,4 @@ Dual-host agent plugin (Claude Code + Grok Build + Codex).
 - `commands/` — slash-command shims
 - `schemas/` — JSON Schema for owned nouns
 - `sample-knowledge/` — fictional demo bundle
-- `scripts/` — init / write / validate
+- `scripts/` — init / write / walk / rollup / validate
