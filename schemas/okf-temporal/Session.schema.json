@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "Session.schema.json",
+  "title": "temporal.session",
+  "description": "Session hub. Identity resolves to AgentIdentity; this schema does not define a new identity type.",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "agent",
+    "status"
+  ],
+  "properties": {
+    "type": {
+      "const": "temporal.session"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9_]+__[a-z0-9_]+__[0-9]{3}$"
+    },
+    "ulid": {
+      "type": "string",
+      "minLength": 26,
+      "maxLength": 26
+    },
+    "agent": {
+      "type": "object",
+      "required": [
+        "name",
+        "role"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "machine": {
+          "type": "string"
+        }
+      }
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "ended_at": {
+      "type": "string"
+    },
+    "close_reason": {
+      "enum": [
+        "clear",
+        "compact",
+        "user",
+        "watchdog"
+      ]
+    },
+    "status": {
+      "enum": [
+        "open",
+        "segmented",
+        "finalized"
+      ]
+    },
+    "parent": {
+      "type": "string"
+    },
+    "segments": {
+      "type": "array"
+    },
+    "author": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string"
+    },
+    "title": {
+      "type": "string"
+    }
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "name": "okf-time-series",
+  "version": "0.1.0",
+  "description": "Chronological spine for agent memory: Session \u2192 Hour \u2192 Day \u2192 Week \u2192 Month \u2192 Year. Git-native OKF plugin.",
+  "author": {
+    "name": "Rick Hightower",
+    "url": "https://github.com/RichardHightower"
+  },
+  "homepage": "https://github.com/SpillwaveSolutions/okf-time-series",
+  "repository": "https://github.com/SpillwaveSolutions/okf-time-series",
+  "license": "MIT",
+  "keywords": [
+    "okf",
+    "second-brain",
+    "agent-plugins",
+    "claude-code",
+    "grok-build",
+    "codex",
+    "deep-agents",
+    "cursor",
+    "wiki-ticket-sdd"
+  ]
+}

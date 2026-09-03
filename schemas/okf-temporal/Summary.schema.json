@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "Summary.schema.json",
+  "title": "temporal.summary",
+  "type": "object",
+  "required": [
+    "type",
+    "title",
+    "session"
+  ],
+  "properties": {
+    "type": {
+      "const": "temporal.summary"
+    },
+    "title": {
+      "type": "string"
+    },
+    "session": {
+      "type": "string"
+    },
+    "author": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string"
+    }
+  }
+}

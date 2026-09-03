@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "Telemetry.schema.json",
+  "title": "temporal.telemetry",
+  "type": "object",
+  "required": [
+    "type",
+    "title",
+    "session"
+  ],
+  "properties": {
+    "type": {
+      "const": "temporal.telemetry"
+    },
+    "title": {
+      "type": "string"
+    },
+    "session": {
+      "type": "string"
+    },
+    "author": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string"
+    }
+  }
+}

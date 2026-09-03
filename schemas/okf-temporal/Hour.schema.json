@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "Hour.schema.json",
+  "title": "temporal.hour",
+  "description": "Hour rollup node on the chronological spine",
+  "type": "object",
+  "required": [
+    "type",
+    "title",
+    "period",
+    "status"
+  ],
+  "properties": {
+    "type": {
+      "const": "temporal.hour"
+    },
+    "title": {
+      "type": "string"
+    },
+    "period": {
+      "type": "string"
+    },
+    "start_date": {
+      "type": "string"
+    },
+    "end_date": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "open",
+        "segmented",
+        "finalized"
+      ]
+    },
+    "aggregates": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "author": {
+      "type": "string"
+    },
+    "timestamp": {
+      "type": "string"
+    }
+  }
+}
