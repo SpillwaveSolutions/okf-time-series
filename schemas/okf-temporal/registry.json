@@ -1,0 +1,15 @@
+{
+  "version": "0.1.0",
+  "plugin": "okf-time-series",
+  "types": [
+    {"type": "temporal.year", "folder": "okf/temporal", "description": "year"},
+    {"type": "temporal.month", "folder": "okf/temporal", "description": "month"},
+    {"type": "temporal.week", "folder": "okf/temporal", "description": "week"},
+    {"type": "temporal.day", "folder": "okf/temporal", "description": "day"},
+    {"type": "temporal.hour", "folder": "okf/temporal", "description": "hour"},
+    {"type": "temporal.session", "folder": "okf/temporal", "description": "session"},
+    {"type": "temporal.telemetry", "folder": "okf/temporal", "description": "telemetry"},
+    {"type": "temporal.summary", "folder": "okf/temporal", "description": "summary"},
+    {"type": "temporal.saliency", "folder": "okf/temporal", "description": "saliency"}
+  ]
+}
