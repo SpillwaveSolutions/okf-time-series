@@ -10,4 +10,4 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ots_common.py" walk --bundle "$SECOND_BRA
 python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ots_common.py" walk --flat --kind session --bundle "$SECOND_BRAIN_ROOT"
 ```
 
-Index-free. Directories are the index. Ticket/epic entry goes through okf-pointers, which is blocked on okf-plugin#73 §2.3.
+Index-free. Directories are the index. Ticket/epic entry goes through okf-pointers (`pointer.link`, sibling of TypedEdge).

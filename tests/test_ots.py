@@ -181,6 +181,7 @@ class TestOts(unittest.TestCase):
                 "Ensure spine",
                 "--bundle",
                 self.bundle,
+                "--ensure-spine",
                 *author,
             ]
         )
@@ -213,6 +214,7 @@ class TestOts(unittest.TestCase):
                 "research",
                 "--bundle",
                 b,
+                "--ensure-spine",
                 *author,
             ]
         )
@@ -224,6 +226,286 @@ class TestOts(unittest.TestCase):
         self.assertEqual(data["prose"], "unchanged")
         self.assertIn("(proposed)", hour.read_text(encoding="utf-8"))
         self.assertIn("## Summary", original)
+
+    def test_write_session_does_not_create_hour_by_default(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        r = run(
+            [
+                "write-session",
+                "--id",
+                "software_engineer__atlas__004",
+                "--period",
+                "2026-08-21T17",
+                "--agent-name",
+                "atlas",
+                "--agent-role",
+                "software_engineer",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["spine"], [])
+        hour = Path(self.bundle) / "okf/temporal/2026/08/21/17/2026-08-21T17.md"
+        self.assertFalse(hour.exists())
+        session = Path(self.bundle) / "okf/temporal/2026/08/21/17/sessions/software_engineer__atlas__004.md"
+        self.assertTrue(session.exists())
+
+    def test_tick_hour_skips_empty(self):
+        r = run(
+            [
+                "tick-hour",
+                "--period",
+                "2026-08-21T18",
+                "--bundle",
+                self.bundle,
+                "--author",
+                "grok-bot/northstar-console",
+            ]
+        )
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["skipped"], "empty")
+        self.assertFalse(data["wrote"])
+        hour = Path(self.bundle) / "okf/temporal/2026/08/21/18/2026-08-21T18.md"
+        self.assertFalse(hour.exists())
+
+    def test_tick_hour_skips_open_session(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        self.assertEqual(
+            run(
+                [
+                    "write-session",
+                    "--id",
+                    "software_engineer__atlas__005",
+                    "--period",
+                    "2026-08-21T19",
+                    "--agent-name",
+                    "atlas",
+                    "--agent-role",
+                    "software_engineer",
+                    "--status",
+                    "open",
+                    "--bundle",
+                    self.bundle,
+                    *author,
+                ]
+            ).returncode,
+            0,
+        )
+        r = run(
+            [
+                "tick-hour",
+                "--period",
+                "2026-08-21T19",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["skipped"], "open_session")
+        self.assertIn("software_engineer__atlas__005", data["open"])
+        hour = Path(self.bundle) / "okf/temporal/2026/08/21/19/2026-08-21T19.md"
+        self.assertFalse(hour.exists())
+
+    def test_tick_hour_writes_when_sessions_closed(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        self.assertEqual(
+            run(
+                [
+                    "write-session",
+                    "--id",
+                    "software_engineer__atlas__006",
+                    "--period",
+                    "2026-08-21T20",
+                    "--agent-name",
+                    "atlas",
+                    "--agent-role",
+                    "software_engineer",
+                    "--status",
+                    "finalized",
+                    "--bundle",
+                    self.bundle,
+                    *author,
+                ]
+            ).returncode,
+            0,
+        )
+        r = run(
+            [
+                "tick-hour",
+                "--period",
+                "2026-08-21T20",
+                "--bundle",
+                self.bundle,
+                "--ensure-parents",
+                *author,
+            ]
+        )
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["wrote"])
+        hour = Path(self.bundle) / "okf/temporal/2026/08/21/20/2026-08-21T20.md"
+        self.assertTrue(hour.exists())
+        self.assertIn("software_engineer__atlas__006.md", hour.read_text(encoding="utf-8"))
+        self.assertIn("(proposed)", hour.read_text(encoding="utf-8"))
+
+    def test_hour_aligned_segments_on_crossing_session(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        r = run(
+            [
+                "write-session",
+                "--id",
+                "software_engineer__atlas__007",
+                "--period",
+                "2026-08-21T21",
+                "--agent-name",
+                "atlas",
+                "--agent-role",
+                "software_engineer",
+                "--started-at",
+                "2026-08-21T21:10:00Z",
+                "--ended-at",
+                "2026-08-21T22:15:00Z",
+                "--title",
+                "Crossing hour boundary",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        self.assertEqual(r.returncode, 0, r.stdout)
+        session = Path(self.bundle) / "okf/temporal/2026/08/21/21/sessions/software_engineer__atlas__007.md"
+        text = session.read_text(encoding="utf-8")
+        self.assertIn("period: 2026-08-21T21", text)
+        self.assertIn("period: 2026-08-21T22", text)
+        v = run(["validate", "--bundle", self.bundle])
+        self.assertEqual(v.returncode, 0, v.stdout)
+
+    def test_close_segment_marks_hour(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        run(
+            [
+                "write-session",
+                "--id",
+                "software_engineer__atlas__008",
+                "--period",
+                "2026-08-21T23",
+                "--agent-name",
+                "atlas",
+                "--agent-role",
+                "software_engineer",
+                "--status",
+                "open",
+                "--started-at",
+                "2026-08-21T23:05:00Z",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        r = run(
+            [
+                "close-segment",
+                "--id",
+                "software_engineer__atlas__008",
+                "--period",
+                "2026-08-21T23",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        self.assertEqual(r.returncode, 0, r.stdout)
+        text = (
+            Path(self.bundle)
+            / "okf/temporal/2026/08/21/23/sessions/software_engineer__atlas__008.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("period: 2026-08-21T23", text)
+        self.assertIn("status: segmented", text)
+
+    def test_prune_telemetry_drops_old_files(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        run(
+            [
+                "write-session",
+                "--id",
+                "research__lumen__003",
+                "--period",
+                "2026-08-22T10",
+                "--agent-name",
+                "lumen",
+                "--agent-role",
+                "research",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        tel = Path(self.bundle) / "okf/temporal/2026/08/22/10/sessions/research__lumen__003.telemetry.md"
+        tel.parent.mkdir(parents=True, exist_ok=True)
+        tel.write_text(
+            "---\ntype: temporal.telemetry\ntitle: old\ntimestamp: 2020-01-01T00:00:00Z\n---\n\n```jsonl\n{}\n```\n",
+            encoding="utf-8",
+        )
+        r = run(["prune-telemetry", "--days", "90", "--bundle", self.bundle])
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["days"], 90)
+        self.assertTrue(any("telemetry" in p for p in data["removed"]))
+        self.assertFalse(tel.exists())
+
+    def test_watchdog_is_global_and_rejects_role(self):
+        r = run(
+            [
+                "watchdog",
+                "--role",
+                "software_engineer",
+                "--bundle",
+                self.bundle,
+                "--author",
+                "grok-bot/northstar-console",
+            ]
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("phase two", r.stdout)
+        author = ["--author", "grok-bot/northstar-console"]
+        run(
+            [
+                "write-session",
+                "--id",
+                "software_engineer__atlas__009",
+                "--period",
+                "2026-08-21T13",
+                "--agent-name",
+                "atlas",
+                "--agent-role",
+                "software_engineer",
+                "--status",
+                "open",
+                "--started-at",
+                "2020-01-01T00:00:00Z",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        w = run(["watchdog", "--bundle", self.bundle, *author])
+        self.assertEqual(w.returncode, 0, w.stdout)
+        data = json.loads(w.stdout)
+        self.assertEqual(data["scope"], "global")
+        self.assertEqual(data["watchdog_seconds"], 3600)
+        self.assertIn("software_engineer__atlas__009", data["closed"])
+        text = (
+            Path(self.bundle)
+            / "okf/temporal/2026/08/21/13/sessions/software_engineer__atlas__009.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("close_reason: watchdog", text)
+        self.assertIn("status: finalized", text)
 
 
 if __name__ == "__main__":

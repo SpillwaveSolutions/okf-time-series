@@ -19,6 +19,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import subprocess
 import sys
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -45,6 +47,10 @@ PERIOD_WEEK = re.compile(r"^(\d{4})-W(\d{2})$")
 PERIOD_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PERIOD_HOUR = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2})$")
 ARTIFACT_SUFFIXES = (".telemetry.md", ".summary.md", ".saliency.md")
+
+# Global watchdog. Per-role configuration is phase two — leave the hook, do not build it.
+WATCHDOG_SECONDS = int(os.environ.get("OKF_WATCHDOG_SECONDS", "3600"))
+TELEMETRY_RETENTION_DAYS = int(os.environ.get("OKF_TELEMETRY_RETENTION_DAYS", "90"))
 
 # Crockford base32, no I L O U. 26 chars = 10-byte timestamp + 16-byte entropy, ULID-shaped.
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
@@ -193,8 +199,8 @@ def iso_week_range(period: str) -> tuple[str, str]:
 def path_for(period: str, kind: str, slug: str | None = None) -> Path:
     """Directory layout from the PRD. Week folder is nested under the month of start_date.
 
-    Open question on #72: ISO weeks that span two months nest under start_date's month only.
-    That is illustrated, not decided.
+    ISO weeks that span two calendar months still nest under start_date's month only.
+    That layout is illustrated, not decided — see the still-open question on #72.
     """
     if kind == "year":
         if not PERIOD_YEAR.match(period):
@@ -285,16 +291,63 @@ def _append_aggregate(parent_file: Path, child_file: Path) -> bool:
     return True
 
 
+def parse_iso(ts: str) -> datetime:
+    return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def hour_period_from_iso(iso: str) -> str:
+    return parse_iso(iso).strftime("%Y-%m-%dT%H")
+
+
+def hours_spanned(started_at: str, ended_at: str) -> list[str]:
+    """Hour periods belonging to a session. Each segment belongs to exactly one Hour."""
+    if not started_at or not ended_at:
+        return []
+    start = parse_iso(started_at).replace(minute=0, second=0, microsecond=0)
+    end = parse_iso(ended_at)
+    hours: list[str] = []
+    cur = start
+    while cur <= end:
+        hours.append(cur.strftime("%Y-%m-%dT%H"))
+        cur += timedelta(hours=1)
+        if len(hours) > 168:
+            break
+    return hours
+
+
+def align_segments(segs: list, started_at: str, ended_at: str) -> list:
+    """Stamp or split segments so each belongs to exactly one hour period."""
+    hours = hours_spanned(started_at, ended_at)
+    if not hours:
+        return segs
+    if not segs:
+        return [{"period": h} for h in hours]
+    if len(segs) == 1 and len(hours) > 1:
+        first = dict(segs[0])
+        first["period"] = hours[0]
+        return [first] + [{"period": h} for h in hours[1:]]
+    out = []
+    for i, seg in enumerate(segs):
+        item = dict(seg) if isinstance(seg, dict) else {"ref": seg}
+        if not item.get("period") and i < len(hours):
+            item["period"] = hours[i]
+        out.append(item)
+    return out
+
+
+def _session_files(hour_dir: Path) -> list[Path]:
+    sdir = hour_dir / "sessions"
+    if not sdir.exists():
+        return []
+    return [p for p in sorted(sdir.glob("*.md")) if not _is_session_artifact(p.name)]
+
+
 def _blank_aggregate_body(title: str) -> str:
     return f"# {title}\n\n## Summary\n\n(proposed)\n\n## Saliency\n\n- (proposed)\n"
 
 
-def ensure_spine(bundle: Path, hour_period: str, author: str) -> list[str]:
-    """Create missing Year→Month→Week→Day→Hour files and wire aggregates.
-
-    Eager Hour nodes, as illustrated on #72 — not a vote on the threshold question.
-    Does not write summary or saliency prose.
-    """
+def ensure_ancestors(bundle: Path, hour_period: str, author: str) -> list[str]:
+    """Create missing Year→Month→Week→Day files. Does not write Hour — that is tick-hour's job."""
     m = PERIOD_HOUR.match(hour_period)
     if not m:
         raise ValueError(f"invalid hour period: {hour_period}")
@@ -309,7 +362,6 @@ def ensure_spine(bundle: Path, hour_period: str, author: str) -> list[str]:
         ("month", f"{year_s}-{month_s}", f"{year_s}-{month_s}-01", f"{year_s}-{month_s}-{last:02d}", f"{year_s}-{month_s}"),
         ("week", week_period, *iso_week_range(week_period), week_period),
         ("day", day, day, day, day),
-        ("hour", hour_period, day, day, hour_period),
     ]
     created: list[str] = []
     files: dict[str, Path] = {}
@@ -338,7 +390,39 @@ def ensure_spine(bundle: Path, hour_period: str, author: str) -> list[str]:
     _append_aggregate(files["year"], files["month"])
     _append_aggregate(files["month"], files["week"])
     _append_aggregate(files["week"], files["day"])
-    _append_aggregate(files["day"], files["hour"])
+    return created
+
+
+def ensure_spine(bundle: Path, hour_period: str, author: str) -> list[str]:
+    """Create missing Year→Hour files. Opt-in via write-session --ensure-spine.
+
+    Hour nodes normally come from tick-hour, not from session writes. This remains
+    available for fixtures and for operators who want a container on disk now.
+    """
+    created = ensure_ancestors(bundle, hour_period, author)
+    m = PERIOD_HOUR.match(hour_period)
+    day = m.group(1)
+    rel = path_for(hour_period, "hour")
+    dest = bundle / rel
+    if not dest.exists():
+        write_md(
+            dest,
+            {
+                "type": "temporal.hour",
+                "title": hour_period,
+                "period": hour_period,
+                "start_date": day,
+                "end_date": day,
+                "status": "open",
+                "timestamp": now_iso(),
+                "author": author,
+                "aggregates": [],
+            },
+            _blank_aggregate_body(hour_period),
+        )
+        created.append(rel.as_posix())
+    day_file = bundle / path_for(day, "day")
+    _append_aggregate(day_file, dest)
     return created
 
 
@@ -434,10 +518,13 @@ def cmd_write_session(args) -> int:
             }
         )
     if segs:
-        meta["segments"] = segs
+        meta["segments"] = align_segments(segs, args.started_at, args.ended_at)
+    elif args.started_at and args.ended_at:
+        aligned = align_segments([], args.started_at, args.ended_at)
+        if len(aligned) > 1:
+            meta["segments"] = aligned
     body = args.body or f"# {args.title or slug}\n"
-    if args.title:
-        meta["title"] = args.title
+    meta["title"] = args.title or slug
     write_md(dest, meta, body)
     hour_file = bundle / path_for(args.period, "hour")
     linked = _append_aggregate(hour_file, dest) if hour_file.exists() else False
@@ -722,9 +809,256 @@ def cmd_validate(args) -> int:
             st = meta.get("status")
             if st and st not in STATUSES:
                 errors.append(f"{c['path']}: invalid status {st}")
+            segs = meta.get("segments") or []
+            seen_periods: list[str] = []
+            for seg in segs:
+                if not isinstance(seg, dict):
+                    continue
+                per = seg.get("period")
+                if not per:
+                    continue
+                if not PERIOD_HOUR.match(str(per)):
+                    errors.append(f"{c['path']}: segment period must be hour-aligned YYYY-MM-DDTHH")
+                if per in seen_periods:
+                    errors.append(f"{c['path']}: two segments for hour {per}")
+                seen_periods.append(str(per))
     result = {"ok": len(errors) == 0, "nodes": seen, "errors": errors}
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
+
+
+def cmd_tick_hour(args) -> int:
+    """Write an Hour node from a scheduled tick.
+
+    Sparse: no sessions in the window → no node.
+    Never touches an Hour that still contains an open session.
+    Does not write partial summaries.
+    """
+    author = resolve_author(args.author)
+    bundle = resolve_bundle(args.bundle)
+    period = args.period
+    if not PERIOD_HOUR.match(period):
+        print(json.dumps({"error": f"invalid hour period: {period}"}))
+        return 1
+    hour_rel = path_for(period, "hour")
+    hour_file = bundle / hour_rel
+    sessions = _session_files(hour_file.parent)
+    if not sessions:
+        print(json.dumps({"ok": True, "skipped": "empty", "period": period, "wrote": False}))
+        return 0
+    open_ids = []
+    for smd in sessions:
+        meta, _ = parse_frontmatter(smd.read_text(encoding="utf-8"))
+        if meta.get("status") == "open":
+            open_ids.append(meta.get("id") or smd.stem)
+    if open_ids:
+        print(json.dumps({"ok": True, "skipped": "open_session", "period": period, "open": open_ids, "wrote": False}))
+        return 0
+    created_parents: list[str] = []
+    if args.ensure_parents:
+        created_parents = ensure_ancestors(bundle, period, author)
+    day = PERIOD_HOUR.match(period).group(1)
+    wrote_file = False
+    if not hour_file.exists():
+        write_md(
+            hour_file,
+            {
+                "type": "temporal.hour",
+                "title": period,
+                "period": period,
+                "start_date": day,
+                "end_date": day,
+                "status": "finalized",
+                "timestamp": now_iso(),
+                "author": author,
+                "aggregates": [],
+            },
+            _blank_aggregate_body(period),
+        )
+        wrote_file = True
+    linked: list[str] = []
+    for smd in sessions:
+        if _append_aggregate(hour_file, smd):
+            linked.append(smd.name)
+    meta, body = parse_frontmatter(hour_file.read_text(encoding="utf-8"))
+    meta["status"] = "finalized"
+    meta["author"] = author
+    meta["timestamp"] = now_iso()
+    write_md(hour_file, meta, body)
+    day_file = bundle / path_for(day, "day")
+    day_linked = _append_aggregate(day_file, hour_file) if day_file.exists() else False
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "wrote": True,
+                "created": wrote_file,
+                "path": str(hour_file),
+                "linked": linked,
+                "parents": created_parents,
+                "day_linked": day_linked,
+                "prose": "unchanged",
+            }
+        )
+    )
+    return 0
+
+
+def cmd_close_segment(args) -> int:
+    """Close the current hour's segment so each segment belongs to exactly one Hour."""
+    author = resolve_author(args.author)
+    bundle = resolve_bundle(args.bundle)
+    period = args.period
+    if not PERIOD_HOUR.match(period):
+        print(json.dumps({"error": f"invalid hour period: {period}"}))
+        return 1
+    slug = args.id
+    root = bundle / "okf" / "temporal"
+    matches = []
+    if root.exists():
+        matches = [p for p in root.rglob(f"{slug}.md") if not _is_session_artifact(p.name)]
+    if not matches:
+        print(json.dumps({"error": "session not found", "id": slug}))
+        return 1
+    dest = matches[0]
+    meta, body = parse_frontmatter(dest.read_text(encoding="utf-8"))
+    segs = list(meta.get("segments") or [])
+    for seg in segs:
+        if isinstance(seg, dict) and seg.get("period") == period:
+            print(json.dumps({"error": "segment already closed for this hour", "period": period}))
+            return 1
+    entry = {"period": period}
+    if args.telemetry:
+        entry["telemetry"] = args.telemetry
+    if args.summary:
+        entry["summary"] = args.summary
+    if args.saliency:
+        entry["saliency"] = args.saliency
+    segs.append(entry)
+    meta["segments"] = segs
+    if meta.get("status") == "open":
+        meta["status"] = "segmented"
+    meta["author"] = author
+    meta["timestamp"] = now_iso()
+    write_md(dest, meta, body)
+    print(json.dumps({"ok": True, "path": str(dest), "period": period, "segments": len(segs)}))
+    return 0
+
+
+def _telemetry_cutoff_time(path: Path) -> datetime:
+    meta, _ = parse_frontmatter(path.read_text(encoding="utf-8"))
+    for key in ("ended_at", "timestamp"):
+        if meta.get(key):
+            try:
+                return parse_iso(str(meta[key]))
+            except ValueError:
+                pass
+    stem = path.name.split(".telemetry")[0]
+    session = path.parent / f"{stem}.md"
+    if session.exists():
+        sm, _ = parse_frontmatter(session.read_text(encoding="utf-8"))
+        if sm.get("ended_at"):
+            try:
+                return parse_iso(str(sm["ended_at"]))
+            except ValueError:
+                pass
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+
+
+def cmd_prune_telemetry(args) -> int:
+    """Drop telemetry files older than N days. Pruning is a git commit of the working tree."""
+    bundle = resolve_bundle(args.bundle)
+    days = TELEMETRY_RETENTION_DAYS if args.days is None else args.days
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    removed: list[str] = []
+    root = bundle / "okf" / "temporal"
+    if root.exists():
+        for p in list(root.rglob("*.md")):
+            if not (p.name.endswith(".telemetry.md") or ".telemetry_" in p.name):
+                continue
+            age = _telemetry_cutoff_time(p)
+            if age >= cutoff:
+                continue
+            rel = "/" + str(p.relative_to(bundle)).replace("\\", "/")
+            if not args.dry_run:
+                p.unlink()
+            removed.append(rel)
+    committed = False
+    git_root = None
+    cur = bundle.resolve()
+    for _ in range(8):
+        if (cur / ".git").exists():
+            git_root = cur
+            break
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    git = shutil.which("git")
+    if removed and git and git_root and not args.dry_run:
+        subprocess.run([git, "-C", str(git_root), "add", "-u", "--", "okf/temporal"], capture_output=True, text=True)
+        proc = subprocess.run(
+            [git, "-C", str(git_root), "commit", "-m", f"prune telemetry older than {days} days"],
+            capture_output=True,
+            text=True,
+        )
+        committed = proc.returncode == 0
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "days": days,
+                "removed": removed,
+                "committed": committed,
+                "dry_run": bool(args.dry_run),
+            }
+        )
+    )
+    return 0
+
+
+def cmd_watchdog(args) -> int:
+    """Close sessions open longer than the global watchdog. Per-role is phase two."""
+    if args.role:
+        print(
+            json.dumps(
+                {
+                    "error": "per-role watchdog is phase two",
+                    "hint": "WATCHDOG_SECONDS is global, default 3600. Leave the hook, do not build it.",
+                }
+            )
+        )
+        return 1
+    author = resolve_author(args.author)
+    bundle = resolve_bundle(args.bundle)
+    seconds = args.seconds if args.seconds else WATCHDOG_SECONDS
+    now = datetime.now(timezone.utc)
+    closed: list[str] = []
+    root = bundle / "okf" / "temporal"
+    if root.exists():
+        for p in root.rglob("*.md"):
+            if _is_session_artifact(p.name) or "sessions" not in p.parts:
+                continue
+            meta, body = parse_frontmatter(p.read_text(encoding="utf-8"))
+            if meta.get("type") != "temporal.session" or meta.get("status") != "open":
+                continue
+            started = meta.get("started_at")
+            if not started:
+                continue
+            try:
+                st = parse_iso(str(started))
+            except ValueError:
+                continue
+            if (now - st).total_seconds() < seconds:
+                continue
+            meta["status"] = "finalized"
+            meta["close_reason"] = "watchdog"
+            meta["ended_at"] = now_iso()
+            meta["author"] = author
+            meta["timestamp"] = now_iso()
+            write_md(p, meta, body)
+            closed.append(str(meta.get("id") or p.stem))
+    print(json.dumps({"ok": True, "closed": closed, "watchdog_seconds": seconds, "scope": "global"}))
+    return 0
 
 
 def main() -> int:
@@ -769,7 +1103,7 @@ def main() -> int:
     s.add_argument("--saliency", default="")
     s.add_argument("--body", default="")
     s.add_argument("--author", default="")
-    s.add_argument("--ensure-spine", dest="ensure_spine", action="store_true", default=True)
+    s.add_argument("--ensure-spine", dest="ensure_spine", action="store_true", default=False)
     s.add_argument("--no-ensure-spine", dest="ensure_spine", action="store_false")
 
     a = sub.add_parser("write-artifact")
@@ -794,6 +1128,32 @@ def main() -> int:
     v = sub.add_parser("validate")
     v.add_argument("--bundle", default="")
 
+    th = sub.add_parser("tick-hour")
+    th.add_argument("--bundle", default="")
+    th.add_argument("--period", required=True, help="hour period, YYYY-MM-DDTHH")
+    th.add_argument("--author", default="")
+    th.add_argument("--ensure-parents", dest="ensure_parents", action="store_true", default=False)
+
+    cs = sub.add_parser("close-segment")
+    cs.add_argument("--bundle", default="")
+    cs.add_argument("--id", required=True)
+    cs.add_argument("--period", required=True, help="hour period this segment belongs to")
+    cs.add_argument("--telemetry", default="")
+    cs.add_argument("--summary", default="")
+    cs.add_argument("--saliency", default="")
+    cs.add_argument("--author", default="")
+
+    pr = sub.add_parser("prune-telemetry")
+    pr.add_argument("--bundle", default="")
+    pr.add_argument("--days", type=int, default=None, help="retention days, default 90")
+    pr.add_argument("--dry-run", dest="dry_run", action="store_true")
+
+    wd = sub.add_parser("watchdog")
+    wd.add_argument("--bundle", default="")
+    wd.add_argument("--author", default="")
+    wd.add_argument("--seconds", type=int, default=0, help="override global WATCHDOG_SECONDS (default 3600)")
+    wd.add_argument("--role", default="", help="rejected: per-role watchdog is phase two")
+
     args = p.parse_args()
     fn = {
         "init": cmd_init,
@@ -804,6 +1164,10 @@ def main() -> int:
         "walk": cmd_walk,
         "rollup": cmd_rollup,
         "validate": cmd_validate,
+        "tick-hour": cmd_tick_hour,
+        "close-segment": cmd_close_segment,
+        "prune-telemetry": cmd_prune_telemetry,
+        "watchdog": cmd_watchdog,
     }[args.cmd]
     return fn(args)
 

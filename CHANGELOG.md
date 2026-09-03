@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 — 2026-09-03
+
+- Hour nodes come from `tick-hour`, not from session writes. Sparse: empty window writes nothing. An Hour that still contains an open session is skipped.
+- `write-session --ensure-spine` is **off** by default.
+- Milestone segments are hour-aligned. `close-segment` closes the current hour's segment so each belongs to exactly one Hour.
+- `prune-telemetry --days 90` (default). Pruning is a git commit of the working tree.
+- Watchdog is global, default one hour. `--role` is rejected (phase two).
+
 ## 0.1.1 — 2026-09-03
 
 - Index-free `walk` (`--flat`, `--kind`) over the filesystem. Directories are the index.

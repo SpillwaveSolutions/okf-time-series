@@ -11,6 +11,8 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ots_common.py" write-session \
   --author "$SECOND_BRAIN_IDENTITY" --bundle "$SECOND_BRAIN_ROOT"
 ```
 
-`--ensure-spine` is on by default: missing Year→Hour files are created as `status: open` and aggregates are wired. Pass `--no-ensure-spine` to write a dangling session (the Hour threshold question on #72 is still open).
+Hour nodes come from `tick-hour`, not from session writes. `--ensure-spine` is **off** by default. Pass it only for fixtures.
+
+A session that crosses an hour boundary closes its segment and opens the next (`close-segment --period YYYY-MM-DDTHH`), so each segment belongs to exactly one Hour.
 
 Never write frontmatter by hand. Children before parent aggregates. Do not invent summary prose in `rollup` — the model proposes, the script only links.
