@@ -34,7 +34,7 @@ Hour nodes come from the scheduled tick, not from session writes. No sessions in
 
 Milestone segments are hour-aligned. Telemetry retention defaults to 90 days. The watchdog is global, default one hour.
 
-Never invent `rel` values. Never write types owned by another plugin. Never hard-code a private remote.
+Never invent TypedEdge `rel` values — that vocabulary is owned by second-brain-core. Never invent Pointers `link_type` values — that taxonomy is owned by okf-pointers. This plugin writes neither. Never write types owned by another plugin. Never hard-code a private remote.
 
 ## Multi-host
 

@@ -7,7 +7,7 @@ Dual-host agent plugin (Claude Code + Grok Build + Codex).
 - Read `docs/ONBOARDING.md` before writing.
 - Write only the noun types listed in README.md.
 - Deterministic writes go through `scripts/`.
-- Do not invent relationship names.
+- Do not invent TypedEdge `rel` values (second-brain-core) or Pointers `link_type` values (okf-pointers). This plugin owns neither vocabulary.
 - Do not hard-code real client or company names in samples. Northstar / Lumenfield only.
 - Identity of the writer belongs in `author` frontmatter.
 - Never hard-code a private remote. Use `SECOND_BRAIN_ROOT`.
@@ -18,4 +18,4 @@ Dual-host agent plugin (Claude Code + Grok Build + Codex).
 - `commands/` — slash-command shims
 - `schemas/` — JSON Schema for owned nouns
 - `sample-knowledge/` — fictional demo bundle
-- `scripts/` — init / write / walk / rollup / validate
+- `scripts/` — init / write / walk / rollup / tick-hour / close-segment / prune-telemetry / validate
