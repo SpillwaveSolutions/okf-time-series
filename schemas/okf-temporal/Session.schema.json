@@ -91,7 +91,8 @@
             ]
           },
           "telemetry": {
-            "type": "string"
+            "type": "string",
+            "description": "Optional even when closed. 90-day prune removes the raw telemetry file from the working tree while the segment stays closed. Absence of the key is not a validation error."
           },
           "summary": {
             "type": "string"
