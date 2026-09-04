@@ -30,7 +30,7 @@ python3 scripts/ots_common.py tick-hour \
   --bundle "$SECOND_BRAIN_ROOT"
 ```
 
-Hour nodes come from the scheduled tick, not from session writes. No sessions in the window means no Hour node — the hierarchy stays sparse. The tick never touches an Hour that still contains an open session.
+Hour nodes come from the scheduled tick, not from session writes. No segments in the window means no Hour node — the hierarchy stays sparse. The tick skips only an Hour that still contains an **open segment**. Closed segments from a long session finalize on schedule. At most one Hour is un-finalized per running session.
 
 Milestone segments are hour-aligned. Telemetry retention defaults to 90 days. The watchdog is global, default one hour.
 

@@ -165,7 +165,9 @@ def dump_frontmatter(meta: dict) -> str:
             lines.append(f"{k}:")
             for item in v:
                 if isinstance(item, dict):
-                    items = list(item.items())
+                    items = [(ik, iv) for ik, iv in item.items() if iv is not None and iv != ""]
+                    if not items:
+                        continue
                     first_k, first_v = items[0]
                     lines.append(f"  - {first_k}: {first_v}")
                     for ik, iv in items[1:]:
@@ -315,23 +317,151 @@ def hours_spanned(started_at: str, ended_at: str) -> list[str]:
     return hours
 
 
+def next_hour_period(period: str) -> str:
+    dt = datetime.strptime(period, "%Y-%m-%dT%H").replace(tzinfo=timezone.utc)
+    return (dt + timedelta(hours=1)).strftime("%Y-%m-%dT%H")
+
+
+def seg_hour(seg: dict) -> str:
+    return str(seg.get("hour") or seg.get("period") or "")
+
+
+def seg_status(seg: dict) -> str:
+    return str(seg.get("status") or "")
+
+
+def seg_index(seg: dict) -> int:
+    try:
+        return int(seg.get("index") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def make_segment(
+    index: int,
+    hour: str,
+    status: str,
+    telemetry: str = "",
+    summary: str = "",
+    saliency: str = "",
+) -> dict:
+    item: dict = {"index": index, "hour": hour, "status": status}
+    if telemetry:
+        item["telemetry"] = telemetry
+    if status == "closed":
+        if summary:
+            item["summary"] = summary
+        if saliency:
+            item["saliency"] = saliency
+    return item
+
+
+def artifact_name(slug: str, kind: str, index: int) -> str:
+    if index <= 1:
+        return f"{slug}.{kind}.md"
+    return f"{slug}.{kind}_{index}.md"
+
+
+def write_proposed_artifact(session_path: Path, name: str, kind: str, slug: str, author: str) -> None:
+    dest = session_path.parent / name
+    if dest.exists():
+        return
+    write_md(
+        dest,
+        {
+            "type": f"temporal.{kind}",
+            "title": f"{slug} {kind}",
+            "session": session_path.name,
+            "timestamp": now_iso(),
+            "author": author,
+        },
+        f"# {slug} {kind}\n\n(proposed)\n",
+    )
+
+
+def close_segment_entry(seg: dict, slug: str, session_path: Path, author: str, summary: str = "", saliency: str = "", telemetry: str = "") -> dict:
+    """Mark a segment closed. Summary and saliency are required; omitted fields get proposed artifacts."""
+    idx = seg_index(seg) or 1
+    out = dict(seg)
+    out["status"] = "closed"
+    out["hour"] = seg_hour(seg)
+    out.pop("period", None)
+    if telemetry:
+        out["telemetry"] = telemetry
+    if not out.get("telemetry"):
+        out["telemetry"] = artifact_name(slug, "telemetry", idx)
+        write_proposed_artifact(session_path, out["telemetry"], "telemetry", slug, author)
+    out["summary"] = summary or out.get("summary") or artifact_name(slug, "summary", idx)
+    out["saliency"] = saliency or out.get("saliency") or artifact_name(slug, "saliency", idx)
+    write_proposed_artifact(session_path, out["summary"], "summary", slug, author)
+    write_proposed_artifact(session_path, out["saliency"], "saliency", slug, author)
+    return out
+
+
+def close_open_segments(meta: dict, session_path: Path, author: str) -> dict:
+    """Used by watchdog / session finalize: every open segment becomes closed."""
+    slug = str(meta.get("id") or session_path.stem)
+    segs = []
+    for seg in meta.get("segments") or []:
+        if not isinstance(seg, dict):
+            continue
+        if seg_status(seg) == "open" or not seg_status(seg):
+            segs.append(close_segment_entry(seg, slug, session_path, author))
+        else:
+            segs.append(seg)
+    if segs:
+        meta["segments"] = segs
+    return meta
+
+
+def iter_session_files(bundle: Path):
+    root = bundle / "okf" / "temporal"
+    if not root.exists():
+        return
+    for p in sorted(root.rglob("*.md")):
+        if _is_session_artifact(p.name) or p.parent.name != "sessions":
+            continue
+        yield p
+
+
+def segments_for_hour(bundle: Path, period: str) -> list[tuple[Path, dict, dict]]:
+    """Index-free: every session file is scanned for a segment whose hour matches."""
+    hits = []
+    for p in iter_session_files(bundle) or []:
+        meta, _ = parse_frontmatter(p.read_text(encoding="utf-8"))
+        if meta.get("type") != "temporal.session":
+            continue
+        for seg in meta.get("segments") or []:
+            if isinstance(seg, dict) and seg_hour(seg) == period:
+                hits.append((p, meta, seg))
+    return hits
+
+
 def align_segments(segs: list, started_at: str, ended_at: str) -> list:
-    """Stamp or split segments so each belongs to exactly one hour period."""
+    """Stamp hour + status so each segment belongs to exactly one Hour."""
     hours = hours_spanned(started_at, ended_at)
     if not hours:
         return segs
     if not segs:
-        return [{"period": h} for h in hours]
-    if len(segs) == 1 and len(hours) > 1:
-        first = dict(segs[0])
-        first["period"] = hours[0]
-        return [first] + [{"period": h} for h in hours[1:]]
+        closed = [make_segment(i, h, "closed") for i, h in enumerate(hours, start=1)]
+        return closed
     out = []
     for i, seg in enumerate(segs):
         item = dict(seg) if isinstance(seg, dict) else {"ref": seg}
-        if not item.get("period") and i < len(hours):
-            item["period"] = hours[i]
+        hour = seg_hour(item) or (hours[i] if i < len(hours) else "")
+        item["hour"] = hour
+        item.pop("period", None)
+        item["index"] = seg_index(item) or (i + 1)
+        if not seg_status(item):
+            item["status"] = "closed" if i < len(hours) - 1 or len(hours) == 1 else "open"
         out.append(item)
+    existing = {seg_hour(s) for s in out}
+    for h in hours:
+        if h not in existing:
+            out.append(make_segment(len(out) + 1, h, "closed"))
+    out.sort(key=lambda s: (seg_hour(s), seg_index(s)))
+    for i, s in enumerate(out, start=1):
+        s["index"] = i
     return out
 
 
@@ -517,12 +647,49 @@ def cmd_write_session(args) -> int:
                 "saliency": args.saliency or "",
             }
         )
+    hour = args.period
     if segs:
-        meta["segments"] = align_segments(segs, args.started_at, args.ended_at)
+        stamped = align_segments(segs, args.started_at, args.ended_at) if args.started_at and args.ended_at else []
+        if not stamped:
+            stamped = [make_segment(1, hour, "open" if status == "open" else "closed", telemetry=args.telemetry, summary=args.summary, saliency=args.saliency)]
+        segs = stamped
     elif args.started_at and args.ended_at:
-        aligned = align_segments([], args.started_at, args.ended_at)
-        if len(aligned) > 1:
-            meta["segments"] = aligned
+        segs = align_segments([], args.started_at, args.ended_at)
+    else:
+        segs = [make_segment(1, hour, "open" if status == "open" else "closed")]
+
+    # Open sessions keep the current hour's segment open. Finalized sessions close every segment.
+    if status == "open":
+        segs = [make_segment(1, hour, "open", telemetry=args.telemetry)]
+    elif status == "finalized":
+        closed = []
+        for i, seg in enumerate(segs, start=1):
+            entry = make_segment(
+                i,
+                seg_hour(seg) or hour,
+                "closed",
+                telemetry=seg.get("telemetry") or args.telemetry,
+                summary=seg.get("summary") or args.summary,
+                saliency=seg.get("saliency") or args.saliency,
+            )
+            closed.append(entry)
+        segs = closed or [make_segment(1, hour, "closed", telemetry=args.telemetry, summary=args.summary, saliency=args.saliency)]
+    else:
+        # segmented: last hour open, earlier hours closed
+        if segs:
+            segs[-1]["status"] = "open"
+            segs[-1].pop("summary", None)
+            segs[-1].pop("saliency", None)
+            for seg in segs[:-1]:
+                seg["status"] = "closed"
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    for seg in segs:
+        if seg_status(seg) == "closed":
+            closed_seg = close_segment_entry(seg, slug, dest, author, summary=seg.get("summary") or args.summary, saliency=seg.get("saliency") or args.saliency, telemetry=seg.get("telemetry") or args.telemetry)
+            seg.clear()
+            seg.update(closed_seg)
+    meta["segments"] = segs
     body = args.body or f"# {args.title or slug}\n"
     meta["title"] = args.title or slug
     write_md(dest, meta, body)
@@ -810,18 +977,34 @@ def cmd_validate(args) -> int:
             if st and st not in STATUSES:
                 errors.append(f"{c['path']}: invalid status {st}")
             segs = meta.get("segments") or []
-            seen_periods: list[str] = []
+            seen_hours: list[str] = []
             for seg in segs:
                 if not isinstance(seg, dict):
+                    errors.append(f"{c['path']}: segment is not an object")
                     continue
-                per = seg.get("period")
-                if not per:
-                    continue
-                if not PERIOD_HOUR.match(str(per)):
-                    errors.append(f"{c['path']}: segment period must be hour-aligned YYYY-MM-DDTHH")
-                if per in seen_periods:
-                    errors.append(f"{c['path']}: two segments for hour {per}")
-                seen_periods.append(str(per))
+                idx = seg_index(seg)
+                if idx < 1:
+                    errors.append(f"{c['path']}: segment index is required and must be >= 1")
+                hour = seg_hour(seg)
+                if not hour:
+                    errors.append(f"{c['path']}: segment hour is required")
+                elif not PERIOD_HOUR.match(hour):
+                    errors.append(f"{c['path']}: segment hour must be hour-aligned YYYY-MM-DDTHH")
+                if hour in seen_hours:
+                    errors.append(f"{c['path']}: two segments for hour {hour}")
+                if hour:
+                    seen_hours.append(hour)
+                st_seg = seg_status(seg)
+                if st_seg not in {"open", "closed"}:
+                    errors.append(f"{c['path']}: segment status must be open|closed")
+                if st_seg == "closed":
+                    if not seg.get("summary"):
+                        errors.append(f"{c['path']}: closed segment missing summary")
+                    if not seg.get("saliency"):
+                        errors.append(f"{c['path']}: closed segment missing saliency")
+                if st_seg == "open":
+                    if seg.get("summary") or seg.get("saliency"):
+                        errors.append(f"{c['path']}: open segment must omit summary and saliency")
     result = {"ok": len(errors) == 0, "nodes": seen, "errors": errors}
     print(json.dumps(result, indent=2))
     return 0 if result["ok"] else 1
@@ -830,9 +1013,9 @@ def cmd_validate(args) -> int:
 def cmd_tick_hour(args) -> int:
     """Write an Hour node from a scheduled tick.
 
-    Sparse: no sessions in the window → no node.
-    Never touches an Hour that still contains an open session.
-    Does not write partial summaries.
+    Sparse: no segments in the window → no node.
+    Skips only the Hour containing an OPEN SEGMENT, not an open session.
+    A closed segment is not partial. Re-running over a finalized Hour is a no-op.
     """
     author = resolve_author(args.author)
     bundle = resolve_bundle(args.bundle)
@@ -842,18 +1025,22 @@ def cmd_tick_hour(args) -> int:
         return 1
     hour_rel = path_for(period, "hour")
     hour_file = bundle / hour_rel
-    sessions = _session_files(hour_file.parent)
-    if not sessions:
+    hits = segments_for_hour(bundle, period)
+    if not hits:
         print(json.dumps({"ok": True, "skipped": "empty", "period": period, "wrote": False}))
         return 0
     open_ids = []
-    for smd in sessions:
-        meta, _ = parse_frontmatter(smd.read_text(encoding="utf-8"))
-        if meta.get("status") == "open":
+    for smd, meta, seg in hits:
+        if seg_status(seg) == "open":
             open_ids.append(meta.get("id") or smd.stem)
     if open_ids:
-        print(json.dumps({"ok": True, "skipped": "open_session", "period": period, "open": open_ids, "wrote": False}))
+        print(json.dumps({"ok": True, "skipped": "open_segment", "period": period, "open": open_ids, "wrote": False}))
         return 0
+    if hour_file.exists():
+        existing, _ = parse_frontmatter(hour_file.read_text(encoding="utf-8"))
+        if existing.get("status") == "finalized":
+            print(json.dumps({"ok": True, "skipped": "already_finalized", "period": period, "wrote": False, "path": str(hour_file)}))
+            return 0
     created_parents: list[str] = []
     if args.ensure_parents:
         created_parents = ensure_ancestors(bundle, period, author)
@@ -877,7 +1064,11 @@ def cmd_tick_hour(args) -> int:
         )
         wrote_file = True
     linked: list[str] = []
-    for smd in sessions:
+    seen_sessions = set()
+    for smd, _meta, _seg in hits:
+        if smd in seen_sessions:
+            continue
+        seen_sessions.add(smd)
         if _append_aggregate(hour_file, smd):
             linked.append(smd.name)
     meta, body = parse_frontmatter(hour_file.read_text(encoding="utf-8"))
@@ -905,7 +1096,11 @@ def cmd_tick_hour(args) -> int:
 
 
 def cmd_close_segment(args) -> int:
-    """Close the current hour's segment so each segment belongs to exactly one Hour."""
+    """Close the current hour's segment so each segment belongs to exactly one Hour.
+
+    A closed segment is not partial. The next hour's segment is opened so the
+    running session stays visible; the tick then finalizes the closed hour.
+    """
     author = resolve_author(args.author)
     bundle = resolve_bundle(args.bundle)
     period = args.period
@@ -922,26 +1117,43 @@ def cmd_close_segment(args) -> int:
         return 1
     dest = matches[0]
     meta, body = parse_frontmatter(dest.read_text(encoding="utf-8"))
-    segs = list(meta.get("segments") or [])
+    segs = [dict(s) if isinstance(s, dict) else s for s in (meta.get("segments") or [])]
+    target = None
     for seg in segs:
-        if isinstance(seg, dict) and seg.get("period") == period:
-            print(json.dumps({"error": "segment already closed for this hour", "period": period}))
-            return 1
-    entry = {"period": period}
-    if args.telemetry:
-        entry["telemetry"] = args.telemetry
-    if args.summary:
-        entry["summary"] = args.summary
-    if args.saliency:
-        entry["saliency"] = args.saliency
-    segs.append(entry)
+        if isinstance(seg, dict) and seg_hour(seg) == period:
+            target = seg
+            break
+    if target is not None and seg_status(target) == "closed":
+        print(json.dumps({"error": "segment already closed for this hour", "period": period}))
+        return 1
+    if target is None:
+        target = make_segment(len(segs) + 1, period, "open", telemetry=args.telemetry)
+        segs.append(target)
+    closed = close_segment_entry(
+        target,
+        slug,
+        dest,
+        author,
+        summary=args.summary,
+        saliency=args.saliency,
+        telemetry=args.telemetry,
+    )
+    target.clear()
+    target.update(closed)
+    nxt = next_hour_period(period)
+    if not any(isinstance(s, dict) and seg_hour(s) == nxt for s in segs):
+        segs.append(make_segment(len(segs) + 1, nxt, "open"))
+    for i, s in enumerate(segs, start=1):
+        if isinstance(s, dict):
+            s["index"] = i
+            s.pop("period", None)
     meta["segments"] = segs
     if meta.get("status") == "open":
         meta["status"] = "segmented"
     meta["author"] = author
     meta["timestamp"] = now_iso()
     write_md(dest, meta, body)
-    print(json.dumps({"ok": True, "path": str(dest), "period": period, "segments": len(segs)}))
+    print(json.dumps({"ok": True, "path": str(dest), "period": period, "segments": len(segs), "opened": nxt}))
     return 0
 
 
@@ -1055,6 +1267,7 @@ def cmd_watchdog(args) -> int:
             meta["ended_at"] = now_iso()
             meta["author"] = author
             meta["timestamp"] = now_iso()
+            close_open_segments(meta, p, author)
             write_md(p, meta, body)
             closed.append(str(meta.get("id") or p.stem))
     print(json.dumps({"ok": True, "closed": closed, "watchdog_seconds": seconds, "scope": "global"}))
