@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 — 2026-09-03
+
+- Hourly tick skips only an Hour containing an **open segment**, not an open session. Closed segments finalize on the normal tick. At most one un-finalized Hour per running session.
+- Session hub `segments[]` is an array of triples. Each segment carries `hour` and `status` (`open|closed`). `summary` and `saliency` are omitted while open and required once closed.
+- `tick-hour` scans every session hub for `segments[].hour` (index-free). Re-running over a finalized Hour is a no-op.
+- A closed segment is not partial. "Do not write partial summaries" stands.
+
 ## 0.2.0 — 2026-09-03
 
 - Hour nodes come from `tick-hour`, not from session writes. Sparse: empty window writes nothing. An Hour that still contains an open session is skipped.

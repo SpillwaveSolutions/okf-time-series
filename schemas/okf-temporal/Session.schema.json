@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "Session.schema.json",
   "title": "temporal.session",
-  "description": "Session hub. Identity resolves to AgentIdentity; this schema does not define a new identity type.",
+  "description": "Session hub. Identity resolves to AgentIdentity; this schema does not define a new identity type. Segments are hour-aligned triples; the tick gates on segment status, not session status.",
   "type": "object",
   "required": [
     "type",
@@ -66,7 +66,61 @@
       "type": "string"
     },
     "segments": {
-      "type": "array"
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "index",
+          "hour",
+          "status"
+        ],
+        "properties": {
+          "index": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "hour": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}$",
+            "description": "Hour period this segment belongs to. Replaces the earlier `period` key."
+          },
+          "status": {
+            "enum": [
+              "open",
+              "closed"
+            ]
+          },
+          "telemetry": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "saliency": {
+            "type": "string"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "status": {
+                  "const": "closed"
+                }
+              },
+              "required": [
+                "status"
+              ]
+            },
+            "then": {
+              "required": [
+                "summary",
+                "saliency"
+              ]
+            }
+          }
+        ]
+      }
     },
     "author": {
       "type": "string"

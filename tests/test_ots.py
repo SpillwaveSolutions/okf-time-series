@@ -272,7 +272,7 @@ class TestOts(unittest.TestCase):
         hour = Path(self.bundle) / "okf/temporal/2026/08/21/18/2026-08-21T18.md"
         self.assertFalse(hour.exists())
 
-    def test_tick_hour_skips_open_session(self):
+    def test_tick_hour_skips_open_segment(self):
         author = ["--author", "grok-bot/northstar-console"]
         self.assertEqual(
             run(
@@ -307,7 +307,7 @@ class TestOts(unittest.TestCase):
         )
         self.assertEqual(r.returncode, 0, r.stdout)
         data = json.loads(r.stdout)
-        self.assertEqual(data["skipped"], "open_session")
+        self.assertEqual(data["skipped"], "open_segment")
         self.assertIn("software_engineer__atlas__005", data["open"])
         hour = Path(self.bundle) / "okf/temporal/2026/08/21/19/2026-08-21T19.md"
         self.assertFalse(hour.exists())
@@ -381,8 +381,8 @@ class TestOts(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout)
         session = Path(self.bundle) / "okf/temporal/2026/08/21/21/sessions/software_engineer__atlas__007.md"
         text = session.read_text(encoding="utf-8")
-        self.assertIn("period: 2026-08-21T21", text)
-        self.assertIn("period: 2026-08-21T22", text)
+        self.assertIn("hour: 2026-08-21T21", text)
+        self.assertIn("hour: 2026-08-21T22", text)
         v = run(["validate", "--bundle", self.bundle])
         self.assertEqual(v.returncode, 0, v.stdout)
 
@@ -425,8 +425,10 @@ class TestOts(unittest.TestCase):
             Path(self.bundle)
             / "okf/temporal/2026/08/21/23/sessions/software_engineer__atlas__008.md"
         ).read_text(encoding="utf-8")
-        self.assertIn("period: 2026-08-21T23", text)
+        self.assertIn("hour: 2026-08-21T23", text)
+        self.assertIn("status: closed", text)
         self.assertIn("status: segmented", text)
+        self.assertIn("hour: 2026-08-22T00", text)
 
     def test_prune_telemetry_drops_old_files(self):
         author = ["--author", "grok-bot/northstar-console"]
@@ -506,6 +508,179 @@ class TestOts(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn("close_reason: watchdog", text)
         self.assertIn("status: finalized", text)
+
+    def test_long_session_finalizes_earlier_hours(self):
+        """Acceptance: 14:00–17:30 session leaves 14–16 finalized and 17 un-finalized while running."""
+        author = ["--author", "grok-bot/northstar-console"]
+        slug = "software_engineer__atlas__010"
+        self.assertEqual(
+            run(
+                [
+                    "write-session",
+                    "--id",
+                    slug,
+                    "--period",
+                    "2026-08-21T14",
+                    "--agent-name",
+                    "atlas",
+                    "--agent-role",
+                    "software_engineer",
+                    "--status",
+                    "open",
+                    "--started-at",
+                    "2026-08-21T14:05:00Z",
+                    "--title",
+                    "Long Northstar ingest",
+                    "--bundle",
+                    self.bundle,
+                    *author,
+                ]
+            ).returncode,
+            0,
+        )
+        for hour in ("2026-08-21T14", "2026-08-21T15", "2026-08-21T16"):
+            r = run(["close-segment", "--id", slug, "--period", hour, "--bundle", self.bundle, *author])
+            self.assertEqual(r.returncode, 0, r.stdout)
+        for hour, folder in (("2026-08-21T14", "14"), ("2026-08-21T15", "15"), ("2026-08-21T16", "16")):
+            t = run(["tick-hour", "--period", hour, "--bundle", self.bundle, "--ensure-parents", *author])
+            self.assertEqual(t.returncode, 0, t.stdout)
+            data = json.loads(t.stdout)
+            self.assertTrue(data["wrote"], data)
+            path = Path(self.bundle) / f"okf/temporal/2026/08/21/{folder}/{hour}.md"
+            self.assertTrue(path.exists())
+            self.assertIn("status: finalized", path.read_text(encoding="utf-8"))
+        skip = run(["tick-hour", "--period", "2026-08-21T17", "--bundle", self.bundle, *author])
+        self.assertEqual(skip.returncode, 0, skip.stdout)
+        data = json.loads(skip.stdout)
+        self.assertEqual(data["skipped"], "open_segment")
+        self.assertFalse((Path(self.bundle) / "okf/temporal/2026/08/21/17/2026-08-21T17.md").exists())
+        # Close the session; first tick after close finalizes hour 17.
+        run(
+            [
+                "close-segment",
+                "--id",
+                slug,
+                "--period",
+                "2026-08-21T17",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        session = Path(self.bundle) / "okf/temporal/2026/08/21/14/sessions" / f"{slug}.md"
+        text = session.read_text(encoding="utf-8")
+        # Finalize the hub (watchdog/user close) — last segment must be closed.
+        run(
+            [
+                "write-session",
+                "--id",
+                slug,
+                "--period",
+                "2026-08-21T14",
+                "--agent-name",
+                "atlas",
+                "--agent-role",
+                "software_engineer",
+                "--status",
+                "finalized",
+                "--started-at",
+                "2026-08-21T14:05:00Z",
+                "--ended-at",
+                "2026-08-21T17:30:00Z",
+                "--close-reason",
+                "user",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        t17 = run(["tick-hour", "--period", "2026-08-21T17", "--bundle", self.bundle, "--ensure-parents", *author])
+        self.assertEqual(t17.returncode, 0, t17.stdout)
+        self.assertTrue(json.loads(t17.stdout)["wrote"])
+        hour17 = Path(self.bundle) / "okf/temporal/2026/08/21/17/2026-08-21T17.md"
+        self.assertTrue(hour17.exists())
+        # Re-tick is a no-op, not a rewrite.
+        before = hour17.read_text(encoding="utf-8")
+        again = run(["tick-hour", "--period", "2026-08-21T17", "--bundle", self.bundle, *author])
+        self.assertEqual(again.returncode, 0, again.stdout)
+        data = json.loads(again.stdout)
+        self.assertEqual(data["skipped"], "already_finalized")
+        self.assertFalse(data["wrote"])
+        self.assertEqual(hour17.read_text(encoding="utf-8"), before)
+
+    def test_closed_segment_missing_summary_fails_validation(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        run(
+            [
+                "write-session",
+                "--id",
+                "software_engineer__atlas__011",
+                "--period",
+                "2026-08-21T12",
+                "--agent-name",
+                "atlas",
+                "--agent-role",
+                "software_engineer",
+                "--status",
+                "open",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        dest = Path(self.bundle) / "okf/temporal/2026/08/21/12/sessions/software_engineer__atlas__011.md"
+        dest.write_text(
+            """---
+type: temporal.session
+id: software_engineer__atlas__011
+agent:
+  name: atlas
+  role: software_engineer
+  machine: northstar-dev-01
+status: segmented
+title: broken closed segment
+segments:
+  - index: 1
+    hour: 2026-08-21T12
+    status: closed
+    telemetry: software_engineer__atlas__011.telemetry.md
+author: grok-bot/northstar-console
+---
+
+Hub with a closed segment that omits summary and saliency.
+""",
+            encoding="utf-8",
+        )
+        v = run(["validate", "--bundle", self.bundle])
+        self.assertNotEqual(v.returncode, 0, v.stdout)
+        self.assertIn("missing summary", v.stdout)
+
+    def test_tick_over_hour_with_only_open_segment_writes_nothing(self):
+        author = ["--author", "grok-bot/northstar-console"]
+        run(
+            [
+                "write-session",
+                "--id",
+                "software_engineer__atlas__012",
+                "--period",
+                "2026-08-21T11",
+                "--agent-name",
+                "atlas",
+                "--agent-role",
+                "software_engineer",
+                "--status",
+                "open",
+                "--bundle",
+                self.bundle,
+                *author,
+            ]
+        )
+        r = run(["tick-hour", "--period", "2026-08-21T11", "--bundle", self.bundle, *author])
+        self.assertEqual(r.returncode, 0, r.stdout)
+        data = json.loads(r.stdout)
+        self.assertEqual(data["skipped"], "open_segment")
+        self.assertFalse(data["wrote"])
+        self.assertFalse((Path(self.bundle) / "okf/temporal/2026/08/21/11/2026-08-21T11.md").exists())
 
 
 if __name__ == "__main__":

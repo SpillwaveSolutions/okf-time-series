@@ -12,6 +12,13 @@ close_reason: clear
 status: finalized
 parent: ../2026-08-21T15.md
 author: grok-bot/okf-time-series
+segments:
+  - index: 1
+    hour: '2026-08-21T15'
+    status: closed
+    telemetry: software_engineer__atlas__002.telemetry.md
+    summary: software_engineer__atlas__002.summary.md
+    saliency: software_engineer__atlas__002.saliency.md
 title: Green the aggregates validator
 ---
 

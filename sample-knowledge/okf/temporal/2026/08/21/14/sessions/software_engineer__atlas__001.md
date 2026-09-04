@@ -13,7 +13,10 @@ status: finalized
 parent: ../2026-08-21T14.md
 author: grok-bot/okf-time-series
 segments:
-  - telemetry: software_engineer__atlas__001.telemetry.md
+  - index: 1
+    hour: '2026-08-21T14'
+    status: closed
+    telemetry: software_engineer__atlas__001.telemetry.md
     summary: software_engineer__atlas__001.summary.md
     saliency: software_engineer__atlas__001.saliency.md
 title: Scaffold Northstar ingest write helper
