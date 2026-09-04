@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 — 2026-09-04
+
+- `tick-hour --period P` processes P plus any earlier un-finalized Hour in the resume worklist (`okf/temporal/.tick-resume.json`). Scheduler is `tick-hour --period $(date -u +%Y-%m-%dT%H)` once an hour.
+- Segment artifacts live in the Hour directory they belong to. The hub stays in the starting Hour and references them by relative path. The tick is a listing of one directory, not a scan of every session ever.
+- `telemetry` is optional on a closed segment. 90-day prune removes the raw file; `summary` and `saliency` stay required.
+- Sample includes a 14:00–17:30 session (four segments, three closed, one open).
+
 ## 0.3.0 — 2026-09-03
 
 - Hourly tick skips only an Hour containing an **open segment**, not an open session. Closed segments finalize on the normal tick. At most one un-finalized Hour per running session.

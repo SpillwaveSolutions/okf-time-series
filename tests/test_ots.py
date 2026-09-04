@@ -160,6 +160,7 @@ class TestOts(unittest.TestCase):
             {
                 "software_engineer__atlas__001",
                 "software_engineer__atlas__002",
+                "software_engineer__atlas__003",
                 "research__lumen__001",
             },
         )
@@ -554,7 +555,10 @@ class TestOts(unittest.TestCase):
         data = json.loads(skip.stdout)
         self.assertEqual(data["skipped"], "open_segment")
         self.assertFalse((Path(self.bundle) / "okf/temporal/2026/08/21/17/2026-08-21T17.md").exists())
-        # Close the session; first tick after close finalizes hour 17.
+        # Artifacts for hours 15 and 16 live in those hour directories, not beside the hub.
+        hub_dir = Path(self.bundle) / "okf/temporal/2026/08/21/14/sessions"
+        self.assertTrue(any((Path(self.bundle) / "okf/temporal/2026/08/21/15/sessions").glob(f"{slug}.summary*")))
+        self.assertFalse(list(hub_dir.glob(f"{slug}.summary_2.md")) or list(hub_dir.glob(f"{slug}.summary_3.md")))
         run(
             [
                 "close-segment",
@@ -562,6 +566,7 @@ class TestOts(unittest.TestCase):
                 slug,
                 "--period",
                 "2026-08-21T17",
+                "--final",
                 "--bundle",
                 self.bundle,
                 *author,
@@ -569,37 +574,17 @@ class TestOts(unittest.TestCase):
         )
         session = Path(self.bundle) / "okf/temporal/2026/08/21/14/sessions" / f"{slug}.md"
         text = session.read_text(encoding="utf-8")
-        # Finalize the hub (watchdog/user close) — last segment must be closed.
-        run(
-            [
-                "write-session",
-                "--id",
-                slug,
-                "--period",
-                "2026-08-21T14",
-                "--agent-name",
-                "atlas",
-                "--agent-role",
-                "software_engineer",
-                "--status",
-                "finalized",
-                "--started-at",
-                "2026-08-21T14:05:00Z",
-                "--ended-at",
-                "2026-08-21T17:30:00Z",
-                "--close-reason",
-                "user",
-                "--bundle",
-                self.bundle,
-                *author,
-            ]
-        )
-        t17 = run(["tick-hour", "--period", "2026-08-21T17", "--bundle", self.bundle, "--ensure-parents", *author])
-        self.assertEqual(t17.returncode, 0, t17.stdout)
-        self.assertTrue(json.loads(t17.stdout)["wrote"])
+        self.assertIn("hour: '2026-08-21T17'", text) if "hour: '2026-08-21T17'" in text else self.assertIn("hour: 2026-08-21T17", text)
+        # Named hour is 18 — the resume worklist revisits 17. Operator does not re-pass 17.
+        t18 = run(["tick-hour", "--period", "2026-08-21T18", "--bundle", self.bundle, "--ensure-parents", *author])
+        self.assertEqual(t18.returncode, 0, t18.stdout)
+        payload = json.loads(t18.stdout)
+        revisited = {h["period"]: h for h in payload["hours"]}
+        self.assertTrue(revisited["2026-08-21T17"].get("wrote"), payload)
+        self.assertEqual(revisited["2026-08-21T18"].get("skipped"), "empty")
         hour17 = Path(self.bundle) / "okf/temporal/2026/08/21/17/2026-08-21T17.md"
         self.assertTrue(hour17.exists())
-        # Re-tick is a no-op, not a rewrite.
+        self.assertIn("status: finalized", hour17.read_text(encoding="utf-8"))
         before = hour17.read_text(encoding="utf-8")
         again = run(["tick-hour", "--period", "2026-08-21T17", "--bundle", self.bundle, *author])
         self.assertEqual(again.returncode, 0, again.stdout)

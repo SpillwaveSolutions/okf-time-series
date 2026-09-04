@@ -47,6 +47,8 @@ PERIOD_WEEK = re.compile(r"^(\d{4})-W(\d{2})$")
 PERIOD_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PERIOD_HOUR = re.compile(r"^(\d{4}-\d{2}-\d{2})T(\d{2})$")
 ARTIFACT_SUFFIXES = (".telemetry.md", ".summary.md", ".saliency.md")
+ARTIFACT_RE = re.compile(r"^(?P<slug>.+)\.(?P<kind>telemetry|summary|saliency)(?:_(?P<n>\d+))?\.md$")
+RESUME_REL = Path("okf/temporal/.tick-resume.json")
 
 # Global watchdog. Per-role configuration is phase two — leave the hook, do not build it.
 WATCHDOG_SECONDS = int(os.environ.get("OKF_WATCHDOG_SECONDS", "3600"))
@@ -362,43 +364,85 @@ def artifact_name(slug: str, kind: str, index: int) -> str:
     return f"{slug}.{kind}_{index}.md"
 
 
-def write_proposed_artifact(session_path: Path, name: str, kind: str, slug: str, author: str) -> None:
-    dest = session_path.parent / name
+def hour_sessions_dir(bundle: Path, period: str) -> Path:
+    return bundle / path_for(period, "hour").parent / "sessions"
+
+
+def rel_to(from_dir: Path, target: Path) -> str:
+    return os.path.relpath(target, from_dir).replace("\\", "/")
+
+
+def parse_artifact_name(name: str) -> tuple[str, str, int] | None:
+    m = ARTIFACT_RE.match(name)
+    if not m:
+        return None
+    return m.group("slug"), m.group("kind"), int(m.group("n") or 1)
+
+
+def write_proposed_artifact(
+    dest_dir: Path,
+    name: str,
+    kind: str,
+    slug: str,
+    author: str,
+    hub_path: Path,
+) -> Path:
+    dest = dest_dir / Path(name).name
+    dest_dir.mkdir(parents=True, exist_ok=True)
     if dest.exists():
-        return
+        return dest
     write_md(
         dest,
         {
             "type": f"temporal.{kind}",
             "title": f"{slug} {kind}",
-            "session": session_path.name,
+            "session": hub_path.name,
+            "hub": rel_to(dest.parent, hub_path),
             "timestamp": now_iso(),
             "author": author,
         },
         f"# {slug} {kind}\n\n(proposed)\n",
     )
+    return dest
 
 
-def close_segment_entry(seg: dict, slug: str, session_path: Path, author: str, summary: str = "", saliency: str = "", telemetry: str = "") -> dict:
-    """Mark a segment closed. Summary and saliency are required; omitted fields get proposed artifacts."""
+def close_segment_entry(
+    seg: dict,
+    slug: str,
+    session_path: Path,
+    author: str,
+    bundle: Path,
+    summary: str = "",
+    saliency: str = "",
+    telemetry: str = "",
+) -> dict:
+    """Mark a segment closed. Summary and saliency are required; omitted fields get proposed artifacts.
+
+    Artifacts land in the Hour directory the segment belongs to. The hub stores paths
+    relative to itself. telemetry is optional on the closed segment — 90-day prune
+    removes the raw file while the segment stays closed.
+    """
     idx = seg_index(seg) or 1
+    hour = seg_hour(seg)
+    dest_dir = hour_sessions_dir(bundle, hour) if hour else session_path.parent
     out = dict(seg)
     out["status"] = "closed"
-    out["hour"] = seg_hour(seg)
+    out["hour"] = hour
     out.pop("period", None)
-    if telemetry:
-        out["telemetry"] = telemetry
-    if not out.get("telemetry"):
-        out["telemetry"] = artifact_name(slug, "telemetry", idx)
-        write_proposed_artifact(session_path, out["telemetry"], "telemetry", slug, author)
-    out["summary"] = summary or out.get("summary") or artifact_name(slug, "summary", idx)
-    out["saliency"] = saliency or out.get("saliency") or artifact_name(slug, "saliency", idx)
-    write_proposed_artifact(session_path, out["summary"], "summary", slug, author)
-    write_proposed_artifact(session_path, out["saliency"], "saliency", slug, author)
+    tel_name = Path(telemetry or out.get("telemetry") or artifact_name(slug, "telemetry", idx)).name
+    sum_name = Path(summary or out.get("summary") or artifact_name(slug, "summary", idx)).name
+    sal_name = Path(saliency or out.get("saliency") or artifact_name(slug, "saliency", idx)).name
+    tel_path = write_proposed_artifact(dest_dir, tel_name, "telemetry", slug, author, session_path)
+    sum_path = write_proposed_artifact(dest_dir, sum_name, "summary", slug, author, session_path)
+    sal_path = write_proposed_artifact(dest_dir, sal_name, "saliency", slug, author, session_path)
+    hub_dir = session_path.parent
+    out["telemetry"] = rel_to(hub_dir, tel_path)
+    out["summary"] = rel_to(hub_dir, sum_path)
+    out["saliency"] = rel_to(hub_dir, sal_path)
     return out
 
 
-def close_open_segments(meta: dict, session_path: Path, author: str) -> dict:
+def close_open_segments(meta: dict, session_path: Path, author: str, bundle: Path) -> dict:
     """Used by watchdog / session finalize: every open segment becomes closed."""
     slug = str(meta.get("id") or session_path.stem)
     segs = []
@@ -406,12 +450,98 @@ def close_open_segments(meta: dict, session_path: Path, author: str) -> dict:
         if not isinstance(seg, dict):
             continue
         if seg_status(seg) == "open" or not seg_status(seg):
-            segs.append(close_segment_entry(seg, slug, session_path, author))
+            segs.append(close_segment_entry(seg, slug, session_path, author, bundle))
         else:
             segs.append(seg)
     if segs:
         meta["segments"] = segs
     return meta
+
+
+def iter_hour_dirs(bundle: Path):
+    root = bundle / "okf" / "temporal"
+    if not root.exists():
+        return
+    for year in sorted(p for p in root.iterdir() if p.is_dir() and p.name.isdigit()):
+        for month in sorted(p for p in year.iterdir() if p.is_dir() and len(p.name) == 2 and p.name.isdigit()):
+            for day in sorted(p for p in month.iterdir() if p.is_dir() and len(p.name) == 2 and p.name.isdigit()):
+                for hour in sorted(p for p in day.iterdir() if p.is_dir() and len(p.name) == 2 and p.name.isdigit()):
+                    yield hour, f"{year.name}-{month.name}-{day.name}T{hour.name}"
+
+
+def listing_for_hour(bundle: Path, period: str) -> dict:
+    """Index-free: one directory listing. Open = telemetry present, summary absent."""
+    sdir = hour_sessions_dir(bundle, period)
+    slugs: dict[str, dict] = {}
+    hubs: list[Path] = []
+    if not sdir.exists():
+        return {"open": [], "hubs": [], "empty": True, "dir": sdir}
+    for p in sorted(sdir.glob("*.md")):
+        parsed = parse_artifact_name(p.name)
+        if parsed:
+            slug, kind, _idx = parsed
+            slot = slugs.setdefault(slug, {"telemetry": False, "summary": False, "saliency": False, "hub_from_artifact": None})
+            slot[kind] = True
+            if slot["hub_from_artifact"] is None:
+                meta, _ = parse_frontmatter(p.read_text(encoding="utf-8"))
+                hub = meta.get("hub")
+                if hub:
+                    slot["hub_from_artifact"] = (p.parent / hub).resolve()
+            continue
+        if SESSION_SLUG.match(p.stem) and p.suffix == ".md":
+            hubs.append(p)
+            meta, _ = parse_frontmatter(p.read_text(encoding="utf-8"))
+            for seg in meta.get("segments") or []:
+                if isinstance(seg, dict) and seg_hour(seg) == period and seg_status(seg) == "open":
+                    slugs.setdefault(p.stem, {"telemetry": True, "summary": False, "saliency": False, "hub_from_artifact": None})
+                    slugs[p.stem]["telemetry"] = True
+    open_ids = [slug for slug, slot in slugs.items() if slot.get("telemetry") and not slot.get("summary")]
+    for p in hubs:
+        if p not in [h for h in hubs]:
+            continue
+    resolved_hubs = list(hubs)
+    for slot in slugs.values():
+        hub = slot.get("hub_from_artifact")
+        if hub and Path(hub).exists() and Path(hub) not in resolved_hubs:
+            resolved_hubs.append(Path(hub))
+    return {"open": open_ids, "hubs": resolved_hubs, "empty": not any(sdir.glob("*.md")), "dir": sdir}
+
+
+def load_resume(bundle: Path) -> list[str]:
+    path = bundle / RESUME_REL
+    if not path.exists():
+        return rebuild_pending(bundle)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        pending = [p for p in data.get("pending") or [] if PERIOD_HOUR.match(str(p))]
+        return pending
+    except (OSError, json.JSONDecodeError):
+        return rebuild_pending(bundle)
+
+
+def save_resume(bundle: Path, pending: list[str]) -> None:
+    path = bundle / RESUME_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"schema": "okf.tick.resume/v0", "pending": pending, "updated_at": now_iso()}, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def rebuild_pending(bundle: Path) -> list[str]:
+    """Worklist, not a content index. Hour dirs with artifacts and no finalized Hour node."""
+    pending = []
+    for hour_dir, period in iter_hour_dirs(bundle) or []:
+        sdir = hour_dir / "sessions"
+        if not sdir.exists() or not any(sdir.glob("*.md")):
+            continue
+        hour_file = hour_dir / f"{period}.md"
+        if hour_file.exists():
+            meta, _ = parse_frontmatter(hour_file.read_text(encoding="utf-8"))
+            if meta.get("status") == "finalized":
+                continue
+        pending.append(period)
+    return pending
 
 
 def iter_session_files(bundle: Path):
@@ -686,7 +816,16 @@ def cmd_write_session(args) -> int:
     dest.parent.mkdir(parents=True, exist_ok=True)
     for seg in segs:
         if seg_status(seg) == "closed":
-            closed_seg = close_segment_entry(seg, slug, dest, author, summary=seg.get("summary") or args.summary, saliency=seg.get("saliency") or args.saliency, telemetry=seg.get("telemetry") or args.telemetry)
+            closed_seg = close_segment_entry(
+                seg,
+                slug,
+                dest,
+                author,
+                bundle,
+                summary=seg.get("summary") or args.summary,
+                saliency=seg.get("saliency") or args.saliency,
+                telemetry=seg.get("telemetry") or args.telemetry,
+            )
             seg.clear()
             seg.update(closed_seg)
     meta["segments"] = segs
@@ -739,7 +878,7 @@ def iter_nodes(bundle: Path):
 
 
 def _is_session_artifact(name: str) -> bool:
-    return name.endswith(ARTIFACT_SUFFIXES)
+    return parse_artifact_name(name) is not None
 
 
 def _record(path: Path, bundle: Path) -> dict | None:
@@ -1010,39 +1149,21 @@ def cmd_validate(args) -> int:
     return 0 if result["ok"] else 1
 
 
-def cmd_tick_hour(args) -> int:
-    """Write an Hour node from a scheduled tick.
-
-    Sparse: no segments in the window → no node.
-    Skips only the Hour containing an OPEN SEGMENT, not an open session.
-    A closed segment is not partial. Re-running over a finalized Hour is a no-op.
-    """
-    author = resolve_author(args.author)
-    bundle = resolve_bundle(args.bundle)
-    period = args.period
-    if not PERIOD_HOUR.match(period):
-        print(json.dumps({"error": f"invalid hour period: {period}"}))
-        return 1
+def tick_one_hour(bundle: Path, period: str, author: str, ensure_parents: bool) -> dict:
+    """Tick a single Hour from a directory listing. Does not print."""
     hour_rel = path_for(period, "hour")
     hour_file = bundle / hour_rel
-    hits = segments_for_hour(bundle, period)
-    if not hits:
-        print(json.dumps({"ok": True, "skipped": "empty", "period": period, "wrote": False}))
-        return 0
-    open_ids = []
-    for smd, meta, seg in hits:
-        if seg_status(seg) == "open":
-            open_ids.append(meta.get("id") or smd.stem)
-    if open_ids:
-        print(json.dumps({"ok": True, "skipped": "open_segment", "period": period, "open": open_ids, "wrote": False}))
-        return 0
+    listing = listing_for_hour(bundle, period)
+    if listing["empty"]:
+        return {"ok": True, "skipped": "empty", "period": period, "wrote": False}
+    if listing["open"]:
+        return {"ok": True, "skipped": "open_segment", "period": period, "open": listing["open"], "wrote": False}
     if hour_file.exists():
         existing, _ = parse_frontmatter(hour_file.read_text(encoding="utf-8"))
         if existing.get("status") == "finalized":
-            print(json.dumps({"ok": True, "skipped": "already_finalized", "period": period, "wrote": False, "path": str(hour_file)}))
-            return 0
+            return {"ok": True, "skipped": "already_finalized", "period": period, "wrote": False, "path": str(hour_file)}
     created_parents: list[str] = []
-    if args.ensure_parents:
+    if ensure_parents:
         created_parents = ensure_ancestors(bundle, period, author)
     day = PERIOD_HOUR.match(period).group(1)
     wrote_file = False
@@ -1064,13 +1185,13 @@ def cmd_tick_hour(args) -> int:
         )
         wrote_file = True
     linked: list[str] = []
-    seen_sessions = set()
-    for smd, _meta, _seg in hits:
-        if smd in seen_sessions:
+    seen = set()
+    for hub in listing["hubs"]:
+        if hub in seen:
             continue
-        seen_sessions.add(smd)
-        if _append_aggregate(hour_file, smd):
-            linked.append(smd.name)
+        seen.add(hub)
+        if _append_aggregate(hour_file, hub):
+            linked.append(hub.name)
     meta, body = parse_frontmatter(hour_file.read_text(encoding="utf-8"))
     meta["status"] = "finalized"
     meta["author"] = author
@@ -1078,20 +1199,52 @@ def cmd_tick_hour(args) -> int:
     write_md(hour_file, meta, body)
     day_file = bundle / path_for(day, "day")
     day_linked = _append_aggregate(day_file, hour_file) if day_file.exists() else False
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "wrote": True,
-                "created": wrote_file,
-                "path": str(hour_file),
-                "linked": linked,
-                "parents": created_parents,
-                "day_linked": day_linked,
-                "prose": "unchanged",
-            }
-        )
-    )
+    return {
+        "ok": True,
+        "wrote": True,
+        "created": wrote_file,
+        "period": period,
+        "path": str(hour_file),
+        "linked": linked,
+        "parents": created_parents,
+        "day_linked": day_linked,
+        "prose": "unchanged",
+    }
+
+
+def cmd_tick_hour(args) -> int:
+    """Write Hour nodes from a scheduled tick.
+
+    Scheduler: `tick-hour --period $(date -u +%Y-%m-%dT%H)` once an hour.
+    Processes the named hour PLUS any earlier un-finalized Hour in the resume
+    worklist that now has no open segment. Sparse. A closed segment is not partial.
+    Re-running over a finalized Hour is a no-op.
+    """
+    author = resolve_author(args.author)
+    bundle = resolve_bundle(args.bundle)
+    period = args.period
+    if not PERIOD_HOUR.match(period):
+        print(json.dumps({"error": f"invalid hour period: {period}"}))
+        return 1
+    pending = load_resume(bundle)
+    earlier = [h for h in pending if h < period]
+    later = [h for h in pending if h > period]
+    hours = earlier + [period]
+    results = [tick_one_hour(bundle, h, author, args.ensure_parents) for h in hours]
+    still = [r["period"] for r in results if r.get("skipped") == "open_segment"]
+    still.extend(later)
+    done = {r["period"] for r in results if r.get("wrote") or r.get("skipped") == "already_finalized"}
+    for h in rebuild_pending(bundle):
+        if h not in still and h not in done:
+            still.append(h)
+    # Unique, chronological.
+    still = sorted(set(still))
+    save_resume(bundle, still)
+    named = next((r for r in results if r["period"] == period), results[-1])
+    named = dict(named)
+    named["hours"] = results
+    named["pending"] = still
+    print(json.dumps(named))
     return 0
 
 
@@ -1134,21 +1287,32 @@ def cmd_close_segment(args) -> int:
         slug,
         dest,
         author,
+        bundle,
         summary=args.summary,
         saliency=args.saliency,
         telemetry=args.telemetry,
     )
     target.clear()
     target.update(closed)
-    nxt = next_hour_period(period)
-    if not any(isinstance(s, dict) and seg_hour(s) == nxt for s in segs):
-        segs.append(make_segment(len(segs) + 1, nxt, "open"))
+    nxt = None
+    if not args.final:
+        nxt = next_hour_period(period)
+        if not any(isinstance(s, dict) and seg_hour(s) == nxt for s in segs):
+            nxt_seg = make_segment(len(segs) + 1, nxt, "open")
+            nxt_dir = hour_sessions_dir(bundle, nxt)
+            tel_name = artifact_name(slug, "telemetry", len(segs) + 1)
+            tel_path = write_proposed_artifact(nxt_dir, tel_name, "telemetry", slug, author, dest)
+            nxt_seg["telemetry"] = rel_to(dest.parent, tel_path)
+            segs.append(nxt_seg)
     for i, s in enumerate(segs, start=1):
         if isinstance(s, dict):
             s["index"] = i
             s.pop("period", None)
     meta["segments"] = segs
-    if meta.get("status") == "open":
+    if args.final and meta.get("status") in {"open", "segmented"}:
+        meta["status"] = "finalized"
+        meta["close_reason"] = meta.get("close_reason") or "user"
+    elif meta.get("status") == "open":
         meta["status"] = "segmented"
     meta["author"] = author
     meta["timestamp"] = now_iso()
@@ -1267,7 +1431,7 @@ def cmd_watchdog(args) -> int:
             meta["ended_at"] = now_iso()
             meta["author"] = author
             meta["timestamp"] = now_iso()
-            close_open_segments(meta, p, author)
+            close_open_segments(meta, p, author, bundle)
             write_md(p, meta, body)
             closed.append(str(meta.get("id") or p.stem))
     print(json.dumps({"ok": True, "closed": closed, "watchdog_seconds": seconds, "scope": "global"}))
@@ -1355,6 +1519,7 @@ def main() -> int:
     cs.add_argument("--summary", default="")
     cs.add_argument("--saliency", default="")
     cs.add_argument("--author", default="")
+    cs.add_argument("--final", action="store_true", help="session is ending; do not open the next hour")
 
     pr = sub.add_parser("prune-telemetry")
     pr.add_argument("--bundle", default="")

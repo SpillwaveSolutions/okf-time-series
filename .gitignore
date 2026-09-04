@@ -11,3 +11,4 @@ knowledge/.index/
 .brain-worktrees/
 .brain-session.json
 replica.manifest.json
+.tick-resume.json
