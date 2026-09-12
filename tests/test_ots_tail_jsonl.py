@@ -48,6 +48,13 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def write_history_marker(parent: Path) -> Path:
+    proj = parent / "project"
+    proj.mkdir(exist_ok=True)
+    (proj / ".okf-history").write_text("", encoding="utf-8")
+    return proj
+
+
 class TestParseAndFilter(unittest.TestCase):
     def test_parse_fixture_skips_tool_result_keeps_last_assistant(self):
         events = []
@@ -93,6 +100,9 @@ class TestTailerOnceAndCursor(unittest.TestCase):
         self.bundle = Path(self.tmp.name) / "bundle"
         self.bundle.mkdir()
         self.cursor = Path(self.tmp.name) / "cursor.json"
+        self.project = Path(self.tmp.name) / "project"
+        self.project.mkdir()
+        (self.project / ".okf-history").write_text("", encoding="utf-8")
         self.env = {"SECOND_BRAIN_IDENTITY": "grok-bot/northstar-console"}
 
     def tearDown(self):
@@ -115,6 +125,8 @@ class TestTailerOnceAndCursor(unittest.TestCase):
             str(self.cursor),
             "--author",
             "local/tailer",
+            "--project",
+            str(self.project),
         ]
 
     def _source(self) -> Path:
@@ -333,31 +345,34 @@ class TestSummarizeLeavesSourceUntouched(unittest.TestCase):
         self.bundle = Path(self.tmp.name) / "bundle"
         self.bundle.mkdir()
         self.cursor = Path(self.tmp.name) / "cursor.json"
+        self.project = write_history_marker(Path(self.tmp.name))
         self.env = {"SECOND_BRAIN_IDENTITY": "grok-bot/northstar-console"}
+
+    def _once(self, extra=None):
+        args = [
+            "once",
+            "--jsonl",
+            str(FIXTURE),
+            "--role",
+            "software_engineer",
+            "--agent",
+            "atlas",
+            "--cursor",
+            str(self.cursor),
+            "--author",
+            "local/tailer",
+            "--project",
+            str(self.project),
+        ]
+        if extra:
+            args.extend(extra)
+        return run_tail(args, env=self.env, bundle=str(self.bundle))
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def test_source_hash_stable_across_summarize(self):
-        r = run_tail(
-            [
-                "once",
-                "--jsonl",
-                str(FIXTURE),
-                "--host",
-                "claude-code",
-                "--role",
-                "software_engineer",
-                "--agent",
-                "atlas",
-                "--cursor",
-                str(self.cursor),
-                "--author",
-                "local/tailer",
-            ],
-            env=self.env,
-            bundle=str(self.bundle),
-        )
+        r = self._once(["--host", "claude-code"])
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         source = list(self.bundle.rglob("software_engineer__atlas__001.source.jsonl"))[0]
         digest = sha256(source)
@@ -394,23 +409,7 @@ class TestSummarizeLeavesSourceUntouched(unittest.TestCase):
         self.assertIn("dangling aggregate", saliency[0].read_text(encoding="utf-8"))
 
     def test_summarize_stub_needs_no_api_key(self):
-        r = run_tail(
-            [
-                "once",
-                "--jsonl",
-                str(FIXTURE),
-                "--role",
-                "software_engineer",
-                "--agent",
-                "atlas",
-                "--cursor",
-                str(self.cursor),
-                "--author",
-                "local/tailer",
-            ],
-            env=self.env,
-            bundle=str(self.bundle),
-        )
+        r = self._once()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         env = dict(self.env)
         env.pop("ANTHROPIC_API_KEY", None)
@@ -424,23 +423,7 @@ class TestSummarizeLeavesSourceUntouched(unittest.TestCase):
         self.assertTrue(json.loads(s.stdout)["ok"])
 
     def test_summarize_without_edition_fails_loudly(self):
-        run_tail(
-            [
-                "once",
-                "--jsonl",
-                str(FIXTURE),
-                "--role",
-                "software_engineer",
-                "--agent",
-                "atlas",
-                "--cursor",
-                str(self.cursor),
-                "--author",
-                "local/tailer",
-            ],
-            env=self.env,
-            bundle=str(self.bundle),
-        )
+        self._once()
         env = dict(self.env)
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("OKF_SUMMARIZE_CMD", None)
@@ -454,23 +437,7 @@ class TestSummarizeLeavesSourceUntouched(unittest.TestCase):
         self.assertNotIn("edition b", s.stdout.lower())  # no silent fallback hint as success
 
     def test_resummarize_leaves_source_hash_unchanged(self):
-        run_tail(
-            [
-                "once",
-                "--jsonl",
-                str(FIXTURE),
-                "--role",
-                "software_engineer",
-                "--agent",
-                "atlas",
-                "--cursor",
-                str(self.cursor),
-                "--author",
-                "local/tailer",
-            ],
-            env=self.env,
-            bundle=str(self.bundle),
-        )
+        self._once()
         source = list(self.bundle.rglob("software_engineer__atlas__001.source.jsonl"))[0]
         digest = sha256(source)
         for _ in range(2):
@@ -488,6 +455,7 @@ class TestEditionsAndInspect(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.bundle = Path(self.tmp.name) / "bundle"
         self.bundle.mkdir()
+        self.project = write_history_marker(Path(self.tmp.name))
         self.env = {"SECOND_BRAIN_IDENTITY": "local/tailer"}
 
     def tearDown(self):
@@ -610,6 +578,8 @@ class TestEditionsAndInspect(unittest.TestCase):
                 str(cursor),
                 "--author",
                 "local/tailer",
+                "--project",
+                str(self.project),
             ],
             env=self.env,
             bundle=str(self.bundle),
@@ -655,6 +625,103 @@ class TestEditionsAndInspect(unittest.TestCase):
         self.assertIn("ots_tail_jsonl.py once", r.stdout)
         self.assertIn("tick-hour", r.stdout)
         self.assertIn("summarize --period", r.stdout)
+
+
+class TestOptInGate(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bundle = Path(self.tmp.name) / "bundle"
+        self.bundle.mkdir()
+        (self.bundle / "okf" / "temporal").mkdir(parents=True)
+        self.cursor = Path(self.tmp.name) / "cursor.json"
+        self.env = {"SECOND_BRAIN_IDENTITY": "local/tailer"}
+        self.bare = Path(self.tmp.name) / "bare-project"
+        self.bare.mkdir()
+        self.once = [
+            "once",
+            "--jsonl",
+            str(FIXTURE),
+            "--role",
+            "software_engineer",
+            "--agent",
+            "local",
+            "--cursor",
+            str(self.cursor),
+            "--author",
+            "local/tailer",
+            "--project",
+            str(self.bare),
+        ]
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_without_marker_once_writes_nothing(self):
+        r = run_tail(self.once, env=self.env, bundle=str(self.bundle))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["skipped"], "not_opted_in")
+        self.assertFalse(data["opted_in"])
+        self.assertFalse(list(self.bundle.rglob("*.source.jsonl")))
+        self.assertFalse(list(self.bundle.rglob("software_engineer__local__001.md")))
+        self.assertFalse(self.cursor.exists())
+
+    def test_bundle_alone_is_not_opt_in(self):
+        r = run_tail(self.once, env=self.env, bundle=str(self.bundle))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(json.loads(r.stdout)["skipped"], "not_opted_in")
+
+    def test_okf_history_produces_snapshot_and_hub(self):
+        project = write_history_marker(Path(self.tmp.name))
+        r = run_tail(self.once + ["--project", str(project)], env=self.env, bundle=str(self.bundle))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["ok"])
+        self.assertNotIn("not_opted_in", data.get("skipped") or "")
+        self.assertTrue(list(self.bundle.rglob("software_engineer__local__001.source.jsonl")))
+        self.assertTrue(list(self.bundle.rglob("software_engineer__local__001.md")))
+
+    def test_session_opt_in_without_project_marker(self):
+        inn = run_tail(["opt-in", "--jsonl", str(FIXTURE)], env=self.env, bundle=str(self.bundle))
+        self.assertEqual(inn.returncode, 0, inn.stdout + inn.stderr)
+        r = run_tail(self.once, env=self.env, bundle=str(self.bundle))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        data = json.loads(r.stdout)
+        self.assertTrue(list(self.bundle.rglob("*.source.jsonl")), data)
+        out = run_tail(["opt-out", "--jsonl", str(FIXTURE)], env=self.env, bundle=str(self.bundle))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.cursor.unlink(missing_ok=True)
+        for p in self.bundle.rglob("software_engineer__local__001.source.jsonl"):
+            p.unlink()
+        skip = run_tail(self.once, env=self.env, bundle=str(self.bundle))
+        self.assertEqual(json.loads(skip.stdout)["skipped"], "not_opted_in")
+
+    def test_check_and_status_report_opt_in(self):
+        skipped = run_tail(
+            ["check", "--jsonl", str(FIXTURE), "--author", "local/tailer"],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(skipped.returncode, 0, skipped.stdout + skipped.stderr)
+        chk = json.loads(skipped.stdout)
+        self.assertFalse(chk["opted_in"])
+        self.assertEqual(chk["skipped"], "not_opted_in")
+        project = write_history_marker(Path(self.tmp.name))
+        ok = run_tail(
+            ["check", "--jsonl", str(FIXTURE), "--author", "local/tailer", "--project", str(project)],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        self.assertTrue(json.loads(ok.stdout)["opted_in"])
+        st = run_tail(
+            ["status", "--jsonl", str(FIXTURE), "--project", str(project), "--role", "software_engineer", "--agent", "local"],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(st.returncode, 0, st.stdout + st.stderr)
+        self.assertTrue(json.loads(st.stdout)["opted_in"])
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@
 - Setup `--edition a` fails if the host CLI is missing or the model is not the pin; `--edition b` fails if the key env is unset.
 - `ots sessions list|show` and `ots summarize --status` show source/summary/saliency presence and excerpts. `ots print-cron` prints suggested crontab lines (user scheduler; not an in-pack queue).
 - Setup writes `okf/temporal/tailer.json` in the bundle (optional `~/.okf/ots-tail.json` overlay). No private remotes. Phase-1 PRD: `docs/PRD-TELEMETRY-PHASE1.md`. `.telemetry.md` omitted in phase 1.
+- Capture is opt-in. `.okf-history` (project) or `ots-tail opt-in` (session). No marker → skip entirely (no snapshot/hub/cursor). A bundle on disk is not opt-in. `check`/`status` report skipped vs opted-in.
 
 ## 0.3.1 — 2026-09-12
 

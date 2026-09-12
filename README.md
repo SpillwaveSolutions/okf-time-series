@@ -32,7 +32,7 @@ python3 scripts/ots_common.py tick-hour \
 
 Hour nodes come from the scheduled tick, not from session writes. No segments in the window means no Hour node — the hierarchy stays sparse. The tick skips only an Hour that still contains an **open segment**. Closed segments from a long session finalize on schedule. At most one Hour is un-finalized per running session.
 
-Host transcripts enter through the official tailer (no LLM). The stored capture is a **byte-for-byte** `sessions/<slug>.source.jsonl` snapshot — not a vendor-neutral emit fence:
+Host transcripts enter through the official tailer (no LLM) **only after opt-in**. Install is not capture: `touch .okf-history` in the project root, or `ots opt-in --jsonl …`. The stored capture is a **byte-for-byte** `sessions/<slug>.source.jsonl` snapshot — not a vendor-neutral emit fence:
 
 ```bash
 python3 scripts/ots_tail_jsonl.py once \

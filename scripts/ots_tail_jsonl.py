@@ -5,7 +5,11 @@ Copies the vendor transcript byte-for-byte into
 `sessions/<slug>.source.jsonl`. That file is the immutable capture.
 No vendor-neutral emit JSONL is stored. No LLM. No host hooks.
 
-Commands: once | follow | start | stop | status | check | setup
+Commands: once | follow | start | stop | status | check | setup | opt-in | opt-out
+
+Capture is opt-in. Install is not capture. No `.okf-history` and no
+session opt-in → skip entirely (no snapshot, hub, or cursor). A bundle
+on disk is not opt-in.
 
 Cursor (path, pos or size/mtime, session_id, updated_at) makes re-tail
 idempotent. Replace the snapshot only if the host size/mtime grew; never
@@ -38,7 +42,9 @@ DEFAULT_POLL = 0.25
 TAILER_CONFIG_REL = Path("okf/temporal/tailer.json")
 CURSOR_REL = Path("okf/temporal/.ots-cursor.json")
 PID_REL = Path("okf/temporal/.ots-tail.pid")
+HISTORY_MARKER = ".okf-history"
 REMOTE_PREFIXES = ("http://", "https://", "git@", "ssh://")
+OPT_IN_HINT = "create .okf-history in the project root or run ots-tail opt-in; a second-brain bundle is not opt-in"
 
 
 def fail(error: str, **extra) -> int:
@@ -65,6 +71,15 @@ def require_identity(explicit: str | None) -> tuple[str, str]:
     process_author = author or "local/tailer"
     actor = identity or process_author
     return process_author, actor
+
+
+def peek_bundle(raw: str | None) -> Path | None:
+    """Existing bundle only. Does not create directories (install ≠ capture)."""
+    value = (raw or os.environ.get("SECOND_BRAIN_ROOT") or "").strip()
+    if not value or looks_like_remote(value):
+        return None
+    p = Path(value)
+    return p.resolve() if p.exists() else None
 
 
 def require_bundle(raw: str | None, *, must_exist: bool = True) -> Path:
@@ -152,6 +167,121 @@ def write_tailer_config(bundle: Path, data: dict) -> Path:
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
     return dest
+
+
+def _as_path_list(raw) -> list[Path]:
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    out: list[Path] = []
+    for item in raw:
+        text = str(item).strip()
+        if not text or looks_like_remote(text):
+            continue
+        out.append(Path(text).expanduser())
+    return out
+
+
+def find_history_root(start: Path | None) -> Path | None:
+    """Walk up for `.okf-history`. Do not treat okf/ or a bundle as a marker."""
+    if start is None:
+        return None
+    cur = start.expanduser().resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for _ in range(48):
+        marker = cur / HISTORY_MARKER
+        if marker.is_file():
+            return cur
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return None
+
+
+def resolve_project(explicit: str | None, jsonl: Path | None) -> Path | None:
+    if explicit:
+        p = Path(explicit).expanduser()
+        return p.resolve() if p.exists() else p.expanduser()
+    env_p = (os.environ.get("OKF_PROJECT_ROOT") or "").strip()
+    if env_p and not looks_like_remote(env_p):
+        p = Path(env_p).expanduser()
+        return p.resolve() if p.exists() else p
+    cwd_hit = find_history_root(Path.cwd())
+    if cwd_hit:
+        return cwd_hit
+    if jsonl is not None:
+        return find_history_root(jsonl)
+    return None
+
+
+def _path_under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def decide_opt_in(
+    jsonl: Path | None,
+    project: Path | None,
+    cfg: dict,
+) -> dict:
+    """Deliberate opt-in only. A bundle on disk is not enough."""
+    sessions = _as_path_list(cfg.get("opt_in_sessions"))
+    dirs = _as_path_list(cfg.get("opt_in_dirs"))
+    if jsonl is not None:
+        j = jsonl.resolve()
+        for listed in sessions:
+            try:
+                if listed.resolve() == j:
+                    return {"opted_in": True, "reason": "session", "project": str(project) if project else "", "marker": ""}
+            except OSError:
+                continue
+    proj = project
+    if proj is None and jsonl is not None:
+        proj = find_history_root(jsonl)
+    if proj is not None:
+        marker_root = find_history_root(proj)
+        if marker_root:
+            return {
+                "opted_in": True,
+                "reason": "project",
+                "project": str(marker_root),
+                "marker": str(marker_root / HISTORY_MARKER),
+            }
+        for listed in dirs:
+            try:
+                if _path_under(proj, listed) or _path_under(listed, proj):
+                    return {"opted_in": True, "reason": "project", "project": str(proj.resolve()), "marker": ""}
+            except OSError:
+                continue
+    return {"opted_in": False, "reason": "none", "project": str(proj) if proj else "", "marker": "", "hint": OPT_IN_HINT}
+
+
+def skip_not_opted_in(decision: dict, **extra) -> int:
+    payload = {
+        "ok": True,
+        "skipped": "not_opted_in",
+        "opted_in": False,
+        "opt_in_reason": decision.get("reason") or "none",
+        "hint": decision.get("hint") or OPT_IN_HINT,
+        **extra,
+    }
+    print(json.dumps(payload))
+    return 0
+
+
+def gate_or_skip(args, jsonl: Path | None, cfg: dict | None = None) -> dict | None:
+    """Return None to skip (already printed). Return decision if opted in."""
+    project = resolve_project(getattr(args, "project", "") or "", jsonl)
+    decision = decide_opt_in(jsonl, project, cfg or {})
+    if not decision.get("opted_in"):
+        skip_not_opted_in(decision, jsonl=str(jsonl) if jsonl else "")
+        return None
+    return decision
 
 
 @dataclass
@@ -506,7 +636,19 @@ def build_tailer(args) -> Tailer:
     )
 
 
+def _peek_cfg(args) -> dict:
+    bundle = peek_bundle(getattr(args, "bundle", ""))
+    if bundle is None:
+        return {}
+    merge_runtime_args(args, bundle)
+    return load_tailer_config(bundle)
+
+
 def cmd_once(args) -> int:
+    cfg = _peek_cfg(args)
+    jsonl = require_jsonl(getattr(args, "jsonl", ""))
+    if gate_or_skip(args, jsonl, cfg) is None:
+        return 0
     tailer = build_tailer(args)
     tailer.once = True
     print(json.dumps(tailer.run()))
@@ -514,6 +656,10 @@ def cmd_once(args) -> int:
 
 
 def cmd_follow(args) -> int:
+    cfg = _peek_cfg(args)
+    jsonl = require_jsonl(getattr(args, "jsonl", ""))
+    if gate_or_skip(args, jsonl, cfg) is None:
+        return 0
     tailer = build_tailer(args)
     tailer.once = False
     print(json.dumps(tailer.run()))
@@ -521,9 +667,12 @@ def cmd_follow(args) -> int:
 
 
 def cmd_start(args) -> int:
+    cfg = _peek_cfg(args)
+    jsonl = require_jsonl(getattr(args, "jsonl", ""))
+    if gate_or_skip(args, jsonl, cfg) is None:
+        return 0
     bundle = require_bundle(args.bundle)
     merge_runtime_args(args, bundle)
-    jsonl = require_jsonl(getattr(args, "jsonl", ""))
     require_identity(getattr(args, "author", ""))
     running = read_pid(bundle)
     if running:
@@ -551,6 +700,8 @@ def cmd_start(args) -> int:
         child += ["--author", args.author]
     if getattr(args, "cursor", ""):
         child += ["--cursor", args.cursor]
+    if getattr(args, "project", ""):
+        child += ["--project", args.project]
     log = bundle / "okf" / "temporal" / ".ots-tail.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     fh = log.open("ab")
@@ -614,6 +765,10 @@ def cmd_status(args) -> int:
             src = source_path_for(session_path, slug)
             if src.exists():
                 source = str(src)
+    jsonl_path = Path(jsonl_raw).expanduser() if jsonl_raw else None
+    if jsonl_path and not jsonl_path.exists():
+        jsonl_path = None
+    decision = decide_opt_in(jsonl_path, resolve_project(getattr(args, "project", "") or "", jsonl_path), cfg)
     print(
         json.dumps(
             {
@@ -626,6 +781,9 @@ def cmd_status(args) -> int:
                 "session_path": session or "",
                 "cursor": cursor.to_json(),
                 "cursor_path": str(cursor_path),
+                "opted_in": bool(decision.get("opted_in")),
+                "opt_in_reason": decision.get("reason") or "none",
+                "skipped": None if decision.get("opted_in") else "not_opted_in",
             }
         )
     )
@@ -649,7 +807,21 @@ def cmd_check(args) -> int:
         reason = cursor.stale_reason(jsonl)
         if reason:
             return fail("cursor stale", reason=reason, cursor=cursor.to_json())
-    print(json.dumps({"ok": True, "source": str(jsonl), "cursor": cursor.to_json()}))
+    cfg = load_tailer_config(bundle)
+    decision = decide_opt_in(jsonl, resolve_project(getattr(args, "project", "") or "", jsonl), cfg)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "source": str(jsonl),
+                "cursor": cursor.to_json(),
+                "opted_in": bool(decision.get("opted_in")),
+                "opt_in_reason": decision.get("reason") or "none",
+                "skipped": None if decision.get("opted_in") else "not_opted_in",
+                "hint": None if decision.get("opted_in") else OPT_IN_HINT,
+            }
+        )
+    )
     return 0
 
 
@@ -707,8 +879,114 @@ def cmd_setup(args) -> int:
         data.update(extra)
         if model:
             data["model"] = extra["model"]
+    existing = load_tailer_config(bundle)
+    for key in ("opt_in_sessions", "opt_in_dirs"):
+        if existing.get(key) and key not in data:
+            data[key] = existing[key]
+    project_raw = (getattr(args, "project", "") or "").strip()
+    if project_raw and not looks_like_remote(project_raw):
+        proj = Path(project_raw).expanduser()
+        proj.mkdir(parents=True, exist_ok=True)
+        marker = proj / HISTORY_MARKER
+        if not marker.exists():
+            marker.write_text("", encoding="utf-8")
+        dirs = [str(x.resolve()) if x.exists() else str(Path(x).expanduser()) for x in _as_path_list(data.get("opt_in_dirs"))]
+        resolved = str(proj.resolve())
+        if resolved not in dirs:
+            dirs.append(resolved)
+        data["opt_in_dirs"] = dirs
     dest = write_tailer_config(bundle, data)
-    print(json.dumps({"ok": True, "path": str(dest), "config": data}))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "path": str(dest),
+                "config": data,
+                "opt_in": {
+                    "project": f"touch {HISTORY_MARKER} in the project root, or ots-tail opt-in --project <dir>",
+                    "session": "ots-tail opt-in --jsonl <transcript.jsonl>",
+                    "note": "install is not capture; a second-brain bundle on disk is not opt-in",
+                },
+            }
+        )
+    )
+    return 0
+
+
+def cmd_opt_in(args) -> int:
+    """Deliberate project marker and/or session transcript allow-list."""
+    jsonl_raw = (getattr(args, "jsonl", "") or "").strip()
+    project_raw = (getattr(args, "project", "") or "").strip()
+    if jsonl_raw and looks_like_remote(jsonl_raw):
+        return fail("do not hard-code a remote")
+    if project_raw and looks_like_remote(project_raw):
+        return fail("do not hard-code a remote")
+    if not jsonl_raw and not project_raw:
+        project_raw = str(Path.cwd())
+    marker = ""
+    if project_raw:
+        proj = Path(project_raw).expanduser()
+        proj.mkdir(parents=True, exist_ok=True)
+        dest = proj / HISTORY_MARKER
+        if not dest.exists():
+            dest.write_text("", encoding="utf-8")
+        marker = str(dest.resolve())
+    bundle = peek_bundle(getattr(args, "bundle", ""))
+    if bundle is None and (jsonl_raw or getattr(args, "bundle", "") or os.environ.get("SECOND_BRAIN_ROOT")):
+        bundle = require_bundle(args.bundle, must_exist=False)
+    cfg = load_tailer_config(bundle) if bundle else {}
+    if jsonl_raw:
+        p = Path(jsonl_raw)
+        if not p.exists() or not p.is_file():
+            return fail("missing source", path=jsonl_raw)
+        sessions = [str(x.resolve()) for x in _as_path_list(cfg.get("opt_in_sessions"))]
+        resolved = str(p.resolve())
+        if resolved not in sessions:
+            sessions.append(resolved)
+        cfg["opt_in_sessions"] = sessions
+    if project_raw and bundle is not None:
+        dirs = [str(x.resolve()) if x.exists() else str(Path(x).expanduser()) for x in _as_path_list(cfg.get("opt_in_dirs"))]
+        resolved = str(Path(project_raw).expanduser().resolve())
+        if resolved not in dirs:
+            dirs.append(resolved)
+        cfg["opt_in_dirs"] = dirs
+    path = str(write_tailer_config(bundle, cfg)) if bundle is not None and (jsonl_raw or project_raw) else ""
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "opted_in": True,
+                "marker": marker,
+                "jsonl": str(Path(jsonl_raw).resolve()) if jsonl_raw else "",
+                "config": path,
+            }
+        )
+    )
+    return 0
+
+
+def cmd_opt_out(args) -> int:
+    jsonl_raw = (getattr(args, "jsonl", "") or "").strip()
+    project_raw = (getattr(args, "project", "") or "").strip()
+    if not jsonl_raw and not project_raw:
+        return fail("pass --jsonl and/or --project to opt-out")
+    removed_marker = ""
+    if project_raw:
+        marker = Path(project_raw).expanduser() / HISTORY_MARKER
+        if marker.is_file():
+            marker.unlink()
+            removed_marker = str(marker)
+    bundle = peek_bundle(getattr(args, "bundle", ""))
+    cfg = load_tailer_config(bundle) if bundle else {}
+    if jsonl_raw and bundle:
+        drop = str(Path(jsonl_raw).expanduser().resolve())
+        cfg["opt_in_sessions"] = [s for s in (cfg.get("opt_in_sessions") or []) if str(Path(s).expanduser().resolve()) != drop]
+    if project_raw and bundle:
+        drop = str(Path(project_raw).expanduser().resolve())
+        cfg["opt_in_dirs"] = [s for s in (cfg.get("opt_in_dirs") or []) if str(Path(s).expanduser().resolve()) != drop]
+    if bundle is not None and (jsonl_raw or project_raw):
+        write_tailer_config(bundle, cfg)
+    print(json.dumps({"ok": True, "opted_in": False, "removed_marker": removed_marker}))
     return 0
 
 
@@ -727,6 +1005,7 @@ def add_common_flags(p: argparse.ArgumentParser, *, require_agent: bool = False)
     p.add_argument("--model", default="", help="must match the pinned cheapest model for --host")
     p.add_argument("--provider", default="", help="edition b provider (anthropic|openai|xai)")
     p.add_argument("--api-key-env", dest="api_key_env", default="", help="edition b key env name")
+    p.add_argument("--project", default="", help="project root to test for .okf-history (not inferred from a bundle)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -738,7 +1017,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--follow", action="store_true", help="compat: long-running foreground")
     add_common_flags(p)
     sub = p.add_subparsers(dest="cmd")
-    for name in ("once", "follow", "start", "stop", "status", "check", "setup"):
+    for name in ("once", "follow", "start", "stop", "status", "check", "setup", "opt-in", "opt-out"):
         sp = sub.add_parser(name)
         add_common_flags(sp)
     return p
@@ -755,7 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.follow:
             cmd = "follow"
         else:
-            return fail("missing command", hint="once|follow|start|stop|status|check|setup")
+            return fail("missing command", hint="once|follow|start|stop|status|check|setup|opt-in|opt-out")
     handlers = {
         "once": cmd_once,
         "follow": cmd_follow,
@@ -764,6 +1043,8 @@ def main(argv: list[str] | None = None) -> int:
         "status": cmd_status,
         "check": cmd_check,
         "setup": cmd_setup,
+        "opt-in": cmd_opt_in,
+        "opt-out": cmd_opt_out,
     }
     try:
         return handlers[cmd](args)

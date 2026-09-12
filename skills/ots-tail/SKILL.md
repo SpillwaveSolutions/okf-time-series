@@ -12,7 +12,17 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ots_tail_jsonl.py" once \
   --bundle "$SECOND_BRAIN_ROOT"
 ```
 
-Commands: `once` · `follow` · `start` · `stop` · `status` · `check` · `setup`
+Commands: `once` · `follow` · `start` · `stop` · `status` · `check` · `setup` · `opt-in` · `opt-out`
+
+Install is not capture. Create a project marker or opt in a transcript **before** anything is written:
+
+```bash
+touch .okf-history
+# or one-off:
+python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ots" opt-in --jsonl /path/to/host-session.jsonl --bundle "$SECOND_BRAIN_ROOT"
+```
+
+No marker and no session opt-in → skip entirely (no `.source.jsonl`, hub, or cursor). Do not infer opt-in from an existing OKF bundle.
 
 - `--follow` / `follow` is long-running. `once` copies if the host grew, then exits.
 - Idle flush default is 300 seconds. Cursor (`path`, `pos` or `size`/`mtime`, `session_id`, `updated_at`) makes restart idempotent.
