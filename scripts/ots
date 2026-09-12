@@ -12,7 +12,7 @@ if str(SCRIPT_DIR) not in sys.path:
 import ots_common  # noqa: E402
 import ots_tail_jsonl  # noqa: E402
 
-TAIL = {"once", "follow", "start", "stop", "status", "check", "setup", "opt-in", "opt-out"}
+TAIL = {"once", "follow", "start", "stop", "status", "check", "setup", "opt-in", "opt-out", "smoke"}
 
 
 def main(argv: list[str] | None = None) -> int:
