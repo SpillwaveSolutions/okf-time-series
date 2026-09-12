@@ -161,6 +161,8 @@ class TestOts(unittest.TestCase):
             },
         )
         self.assertFalse(any(n["id"] == "software_engineer__atlas__002" for n in sessions))
+        leftover = [p for p in sample.rglob("*atlas__002*") if p.is_file()]
+        self.assertFalse(leftover, leftover)
         sample_text = (sample / "okf/temporal/2026/08/21/14/sessions/software_engineer__atlas__001.md").read_text(
             encoding="utf-8"
         )
