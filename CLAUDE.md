@@ -10,7 +10,7 @@ Chronological agent memory. Session → Hour → Day → Week → Month → Year
 
 1. Identify the noun (`temporal.year|month|week|day|hour|session` plus telemetry/summary/saliency).
 2. Check `schemas/okf-temporal/` for required fields.
-3. Call `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ots_common.py write-session|write-aggregate|write-artifact ...` (host JSONL → `ots_tail_jsonl.py`; do not invent telemetry lines).
+3. Call `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/ots_common.py write-session|write-aggregate|write-artifact ...` (host JSONL → `ots_tail_jsonl.py` → `.source.jsonl`; do not invent a stored emit schema).
 4. The model proposes summary and saliency prose. This script commits frontmatter.
 5. Session `agent` resolves to existing `AgentIdentity`. Do not define a new identity type.
 

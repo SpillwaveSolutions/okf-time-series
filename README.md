@@ -32,19 +32,18 @@ python3 scripts/ots_common.py tick-hour \
 
 Hour nodes come from the scheduled tick, not from session writes. No segments in the window means no Hour node — the hierarchy stays sparse. The tick skips only an Hour that still contains an **open segment**. Closed segments from a long session finalize on schedule. At most one Hour is un-finalized per running session.
 
-Host transcripts enter through the official tailer (no LLM):
+Host transcripts enter through the official tailer (no LLM) **only after opt-in**. Install is not capture: `touch .okf-history` in the project root, or `ots opt-in --jsonl …`. The stored capture is a **byte-for-byte** `sessions/<slug>.source.jsonl` snapshot — not a vendor-neutral emit fence:
 
 ```bash
-python3 scripts/ots_tail_jsonl.py --once \
+python3 scripts/ots_tail_jsonl.py once \
   --jsonl tests/fixtures/host-session.jsonl \
   --host claude-code \
   --role software_engineer --agent atlas --n 1 \
   --author "$SECOND_BRAIN_IDENTITY" \
-  --bundle "$SECOND_BRAIN_ROOT" \
-  --cursor /tmp/ots-bundle/host-session.ots-cursor.json
+  --bundle "$SECOND_BRAIN_ROOT"
 ```
 
-Pipeline: tail → `tick-hour` → `rollup` → Haiku summary (separate) → overnight pointers (separate). Body contract: [schemas/okf-temporal/TELEMETRY_EMIT.md](schemas/okf-temporal/TELEMETRY_EMIT.md).
+`ots-tail` also has `start` / `stop` / `status` / `check` / `setup` (`setup` writes `okf/temporal/tailer.json`; never a private remote). Pipeline: tail → `tick-hour` → `summarize --period` → `rollup` → overnight pointers (separate). Summarize Edition A (host CLI + pinned cheapest model) or Edition B (API key). Inspect with `ots sessions list` / `show`. Cron helper: `ots print-cron`. Phase-1 snapshot rule: [docs/PRD-TELEMETRY-PHASE1.md](docs/PRD-TELEMETRY-PHASE1.md). Emit table is a **read-time filter**, not stored: [docs/TELEMETRY_EMIT.md](docs/TELEMETRY_EMIT.md).
 
 Milestone segments are hour-aligned. Telemetry retention defaults to 90 days. The watchdog is global, default one hour.
 

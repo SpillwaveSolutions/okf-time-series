@@ -12,6 +12,10 @@ Samples stay **Northstar / Lumenfield** fiction.
 
 Ingest pipeline (each step is its own process):
 
-`ots_tail_jsonl.py` → `tick-hour` → `rollup` → Haiku summary (separate) → overnight pointers (separate)
+`ots_tail_jsonl.py` (snapshot) → `tick-hour` → `summarize --period` → `rollup` → overnight pointers (separate)
 
-The tailer is read-only on the host JSONL and writes append-only `temporal.telemetry` under `path_for`. Body contract: [schemas/okf-temporal/TELEMETRY_EMIT.md](../schemas/okf-temporal/TELEMETRY_EMIT.md). No LLM in the tailer.
+`scripts/ots` is a thin dispatcher (`ots once`, `ots summarize`, `ots sessions list`, `ots print-cron`).
+
+Capture is opt-in. `touch .okf-history` in the project, or `ots opt-in --jsonl <transcript>`. A bundle on disk is not opt-in.
+
+The tailer is read-only on the host JSONL and copies it to `sessions/<slug>.source.jsonl`. No vendor-neutral emit JSONL is stored. No LLM in the tailer. Summarization applies the host-switch filter at read time: [TELEMETRY_EMIT.md](TELEMETRY_EMIT.md). Three planes + snapshot rule: [PRD-TELEMETRY-PHASE1.md](PRD-TELEMETRY-PHASE1.md).

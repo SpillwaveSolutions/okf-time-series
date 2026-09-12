@@ -15,9 +15,7 @@ SCRIPT = ROOT / "scripts" / "ots_common.py"
 
 
 def run(args, env=None, bundle=None):
-    e = os.environ.copy()
-    if env:
-        e.update(env)
+    e = env if env is not None else os.environ.copy()
     cmd = [sys.executable, str(SCRIPT), *args]
     if bundle is not None and "--bundle" not in args:
         cmd += ["--bundle", bundle]

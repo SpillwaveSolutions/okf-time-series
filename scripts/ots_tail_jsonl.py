@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""Thin official JSONL tailer for okf-time-series.
+"""Snapshot-first host JSONL tailer for okf-time-series.
 
-Read-only on the host JSONL. No LLM. Inference stays on hour-close Haiku
-summary and overnight pointer batch (out of process).
+Copies the vendor transcript byte-for-byte into
+`sessions/<slug>.source.jsonl`. That file is the immutable capture.
+No vendor-neutral emit JSONL is stored. No LLM. No host hooks.
 
-Writes only through ots_common paths: write-session once (--ensure-spine),
-close-segment on hour rollover (same session id), and a single
-`.telemetry.md` that is created once then append-only inside the jsonl fence.
+Commands: once | follow | start | stop | status | check | setup | opt-in | opt-out
 
-Cursor file (byte pos + last session_id/turn/role or source_offset) is
-required for restart-without-duplicate. Default: `<jsonl>.ots-cursor.json`
-next to the host file — not a temporal noun.
+Capture is opt-in. Install is not capture. No `.okf-history` and no
+session opt-in → skip entirely (no snapshot, hub, or cursor). A bundle
+on disk is not opt-in.
+
+Cursor (path, pos or size/mtime, session_id, updated_at) makes re-tail
+idempotent. Replace the snapshot only if the host size/mtime grew; never
+shrink. Idle flush default 300s. Hour rollover keeps the same session slug.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -29,13 +33,18 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import ots_common as ots  # noqa: E402
+import ots_editions as editions  # noqa: E402
+import ots_filter as flt  # noqa: E402
 
-EMIT_VERSION = 1
-REQUIRED_EMIT_KEYS = ("v", "ts", "host", "session_id", "actor", "turn", "role", "text")
-HOSTS = ("claude-code", "grok-build", "codex", "deep-agents")
-ROLES = ("user", "assistant")
-DEFAULT_IDLE = 2.0
+HOSTS = flt.HOSTS
+DEFAULT_IDLE = 300.0
 DEFAULT_POLL = 0.25
+TAILER_CONFIG_REL = Path("okf/temporal/tailer.json")
+CURSOR_REL = Path("okf/temporal/.ots-cursor.json")
+PID_REL = Path("okf/temporal/.ots-tail.pid")
+HISTORY_MARKER = ".okf-history"
+REMOTE_PREFIXES = ("http://", "https://", "git@", "ssh://")
+OPT_IN_HINT = "create .okf-history in the project root or run ots-tail opt-in; a second-brain bundle is not opt-in"
 
 
 def fail(error: str, **extra) -> int:
@@ -44,326 +53,66 @@ def fail(error: str, **extra) -> int:
     return 1
 
 
+def now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def looks_like_remote(value: str) -> bool:
+    text = (value or "").strip()
+    return text.startswith(REMOTE_PREFIXES)
+
+
 def require_identity(explicit: str | None) -> tuple[str, str]:
     """Return (process_author, actor). Identity must be claimed."""
     identity = (os.environ.get("SECOND_BRAIN_IDENTITY") or "").strip()
     author = (explicit or "").strip()
     if not identity and not author:
-        raise SystemExit(fail("missing identity", hint="pass --author or set SECOND_BRAIN_IDENTITY"))
+        raise SystemExit(fail("unset identity", hint="pass --author or set SECOND_BRAIN_IDENTITY"))
     process_author = author or "local/tailer"
     actor = identity or process_author
     return process_author, actor
 
 
-def require_bundle(raw: str | None) -> Path:
+def peek_bundle(raw: str | None) -> Path | None:
+    """Existing bundle only. Does not create directories (install ≠ capture)."""
+    value = (raw or os.environ.get("SECOND_BRAIN_ROOT") or "").strip()
+    if not value or looks_like_remote(value):
+        return None
+    p = Path(value)
+    return p.resolve() if p.exists() else None
+
+
+def require_bundle(raw: str | None, *, must_exist: bool = True) -> Path:
     value = (raw or os.environ.get("SECOND_BRAIN_ROOT") or "").strip()
     if not value:
         raise SystemExit(fail("missing bundle", hint="pass --bundle or set SECOND_BRAIN_ROOT"))
+    if looks_like_remote(value):
+        raise SystemExit(fail("do not hard-code a remote", hint="use SECOND_BRAIN_ROOT as a local path"))
     p = Path(value)
-    if not p.exists():
+    if must_exist and not p.exists():
         raise SystemExit(fail("missing bundle", path=str(p)))
+    p.mkdir(parents=True, exist_ok=True)
     return p.resolve()
 
 
 def require_jsonl(raw: str | None) -> Path:
     if not raw:
-        raise SystemExit(fail("missing jsonl", hint="pass --jsonl"))
+        raise SystemExit(fail("missing source", hint="pass --jsonl or run setup"))
+    if looks_like_remote(raw):
+        raise SystemExit(fail("do not hard-code a remote", hint="use a local host JSONL path"))
     p = Path(raw)
     if not p.exists() or not p.is_file():
-        raise SystemExit(fail("missing jsonl", path=str(p)))
+        raise SystemExit(fail("missing source", path=str(p)))
     return p.resolve()
 
 
-def normalize_ts(raw) -> str:
-    if raw is None or raw == "":
-        return ots.now_iso()
-    text = str(raw).strip()
-    try:
-        dt = ots.parse_iso(text)
-    except ValueError:
-        try:
-            dt = datetime.fromisoformat(text)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-        except ValueError:
-            return ots.now_iso()
-    return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def _message(record: dict) -> dict:
-    msg = record.get("message")
-    return msg if isinstance(msg, dict) else {}
-
-
-def is_tool_result_user(record: dict) -> bool:
-    """Skip host user lines that are tool_result payloads, not prompts."""
-    role = record.get("type") or record.get("role") or _message(record).get("role")
-    if role not in {"user", "tool_result"}:
-        return False
-    if record.get("type") == "tool_result":
-        return True
-    content = _message(record).get("content", record.get("content"))
-    if isinstance(content, list):
-        has_tool = False
-        has_text = False
-        for block in content:
-            if isinstance(block, str) and block.strip():
-                has_text = True
-            elif isinstance(block, dict):
-                if block.get("type") == "tool_result":
-                    has_tool = True
-                elif block.get("type") == "text" and str(block.get("text") or "").strip():
-                    has_text = True
-        return has_tool and not has_text
-    return False
-
-
-def extract_text(record: dict) -> str:
-    if isinstance(record.get("text"), str) and record.get("text").strip():
-        if not is_tool_result_user(record):
-            return record["text"].strip()
-    content = _message(record).get("content", record.get("content"))
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, str) and block.strip():
-                parts.append(block.strip())
-            elif isinstance(block, dict) and block.get("type") == "text":
-                text = str(block.get("text") or "").strip()
-                if text:
-                    parts.append(text)
-        return "\n".join(parts).strip()
-    return ""
-
-
-def host_role(record: dict) -> str | None:
-    role = record.get("type") or record.get("role") or _message(record).get("role")
-    if role in ROLES:
-        return role
-    return None
-
-
-def host_model(record: dict) -> str:
-    msg = _message(record)
-    for key in ("model",):
-        val = record.get(key) or msg.get(key)
-        if val:
-            return str(val)
-    return ""
-
-
-@dataclass
-class HostEvent:
-    role: str
-    text: str
-    ts: str
-    offset: int
-    model: str = ""
-    tool_result: bool = False
-
-
-def parse_host_record(line: str, offset: int) -> HostEvent | None:
-    """Parse one host JSONL line. Claude Code shape, plus a plain role/text object."""
-    text = line.strip()
-    if not text:
-        return None
-    try:
-        record = json.loads(text)
-    except json.JSONDecodeError:
-        return None
-    if not isinstance(record, dict):
-        return None
-    tool_result = is_tool_result_user(record)
-    role = host_role(record)
-    if tool_result:
-        return HostEvent(role="user", text="", ts=normalize_ts(record.get("timestamp") or record.get("ts")), offset=offset, tool_result=True)
-    if role not in ROLES:
-        return None
-    body = extract_text(record)
-    if role == "assistant" and not body:
-        # tool_use-only assistant: keep last text elsewhere, do not emit
-        return HostEvent(role="assistant", text="", ts=normalize_ts(record.get("timestamp") or record.get("ts")), offset=offset, model=host_model(record))
-    if role == "user" and not body:
-        return None
-    return HostEvent(
-        role=role,
-        text=body,
-        ts=normalize_ts(record.get("timestamp") or record.get("ts")),
-        offset=offset,
-        model=host_model(record),
-    )
-
-
-def validate_emit(obj: dict) -> list[str]:
-    errors: list[str] = []
-    if not isinstance(obj, dict):
-        return ["not an object"]
-    for key in REQUIRED_EMIT_KEYS:
-        if key not in obj or obj[key] in ("", None):
-            errors.append(f"missing {key}")
-    if "v" in obj and obj["v"] != EMIT_VERSION:
-        errors.append(f"v must be {EMIT_VERSION}")
-    if obj.get("host") not in HOSTS:
-        errors.append("invalid host")
-    if obj.get("role") not in ROLES:
-        errors.append("invalid role")
-    turn = obj.get("turn")
-    if turn is not None and not (isinstance(turn, int) and not isinstance(turn, bool) and turn >= 1):
-        errors.append("turn must be a monotonic int >= 1")
-    return errors
-
-
-def build_emit(
-    *,
-    ts: str,
-    host: str,
-    session_id: str,
-    actor: str,
-    turn: int,
-    role: str,
-    text: str,
-    model: str = "",
-    source_path: str = "",
-    source_offset: int | None = None,
-) -> dict:
-    obj: dict = {
-        "v": EMIT_VERSION,
-        "ts": ts,
-        "host": host,
-        "session_id": session_id,
-        "actor": actor,
-        "turn": turn,
-        "role": role,
-        "text": text,
-    }
-    if model:
-        obj["model"] = model
-    if source_path:
-        obj["source_path"] = source_path
-    if source_offset is not None:
-        obj["source_offset"] = source_offset
-    return obj
-
-
-@dataclass
-class Cursor:
-    pos: int = 0
-    source_path: str = ""
-    source_offset: int = -1
-    last_session_id: str = ""
-    last_turn: int = 0
-    last_role: str = ""
-
-    def to_json(self) -> dict:
-        out = {
-            "v": EMIT_VERSION,
-            "pos": self.pos,
-            "source_path": self.source_path,
-            "source_offset": self.source_offset,
-        }
-        if self.last_session_id and self.last_role:
-            out["last"] = {
-                "session_id": self.last_session_id,
-                "turn": self.last_turn,
-                "role": self.last_role,
-            }
-        return out
-
-    def already_emitted(self, session_id: str, turn: int, role: str, source_offset: int | None) -> bool:
-        if source_offset is not None and self.source_offset >= 0 and source_offset <= self.source_offset:
-            if self.last_session_id == session_id and self.last_turn == turn and self.last_role == role:
-                return True
-            if source_offset < self.source_offset:
-                return True
-        if (
-            self.last_session_id
-            and self.last_session_id == session_id
-            and self.last_turn == turn
-            and self.last_role == role
-        ):
-            return True
-        return False
-
-
-def load_cursor(path: Path) -> Cursor:
-    if not path.exists():
-        return Cursor()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return Cursor()
-    last = data.get("last") or {}
-    return Cursor(
-        pos=int(data.get("pos") or 0),
-        source_path=str(data.get("source_path") or ""),
-        source_offset=int(data.get("source_offset") if data.get("source_offset") is not None else -1),
-        last_session_id=str(last.get("session_id") or ""),
-        last_turn=int(last.get("turn") or 0),
-        last_role=str(last.get("role") or ""),
-    )
-
-
-def save_cursor(path: Path, cursor: Cursor) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(cursor.to_json(), indent=2) + "\n", encoding="utf-8")
-
-
-def jsonl_fence_lines(text: str) -> list[str]:
-    marker = "```jsonl"
-    idx = text.find(marker)
-    if idx < 0:
-        return []
-    after = idx + len(marker)
-    close = text.find("```", after)
-    inner = text[after:] if close < 0 else text[after:close]
-    return [ln for ln in inner.splitlines() if ln.strip()]
-
-
-def existing_emit_keys(path: Path) -> set[tuple]:
-    keys: set[tuple] = set()
-    if not path.exists():
-        return keys
-    for line in jsonl_fence_lines(path.read_text(encoding="utf-8")):
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and obj.get("session_id") and obj.get("role"):
-            keys.add((obj.get("session_id"), obj.get("turn"), obj.get("role")))
-    return keys
-
-
-def append_emit_line(path: Path, obj: dict) -> None:
-    """Append one JSONL object inside the fence. Does not rewrite earlier records."""
-    payload = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
-    if not path.exists():
-        raise FileNotFoundError(path)
-    text = path.read_text(encoding="utf-8")
-    marker = "```jsonl"
-    idx = text.find(marker)
-    if idx < 0:
-        if not text.endswith("\n"):
-            text += "\n"
-        path.write_text(text + f"```jsonl\n{payload}\n```\n", encoding="utf-8")
-        return
-    after = idx + len(marker)
-    close = text.find("```", after)
-    if close < 0:
-        if not text.endswith("\n"):
-            text += "\n"
-        path.write_text(text + payload + "\n```\n", encoding="utf-8")
-        return
-    inner = text[after:close]
-    if inner.startswith("\r\n"):
-        inner = inner[2:]
-    elif inner.startswith("\n"):
-        inner = inner[1:]
-    if inner and not inner.endswith("\n"):
-        inner += "\n"
-    inner += payload + "\n"
-    path.write_text(text[:idx] + "```jsonl\n" + inner + text[close:], encoding="utf-8")
+def session_slug(role: str, agent: str, n: int) -> str:
+    role_s = role.strip().lower().replace("-", "_")
+    agent_s = agent.strip().lower().replace("-", "_")
+    slug = f"{role_s}__{agent_s}__{n:03d}"
+    if not ots.SESSION_SLUG.match(slug):
+        raise SystemExit(fail("invalid session slug", id=slug))
+    return slug
 
 
 def find_session(bundle: Path, slug: str) -> Path | None:
@@ -376,6 +125,10 @@ def find_session(bundle: Path, slug: str) -> Path | None:
         if p.parent.name == "sessions" and not ots._is_session_artifact(p.name)
     ]
     return matches[0] if matches else None
+
+
+def source_path_for(session_path: Path, slug: str) -> Path:
+    return session_path.parent / f"{slug}.source.jsonl"
 
 
 def _ots_cli(argv: list[str], bundle: Path, author: str) -> dict:
@@ -398,13 +151,216 @@ def _ots_cli(argv: list[str], bundle: Path, author: str) -> dict:
     return data
 
 
-def session_slug(role: str, agent: str, n: int) -> str:
-    role_s = role.strip().lower().replace("-", "_")
-    agent_s = agent.strip().lower().replace("-", "_")
-    slug = f"{role_s}__{agent_s}__{n:03d}"
-    if not ots.SESSION_SLUG.match(slug):
-        raise SystemExit(fail("invalid session slug", id=slug))
-    return slug
+def load_tailer_config(bundle: Path) -> dict:
+    path = bundle / TAILER_CONFIG_REL
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_tailer_config(bundle: Path, data: dict) -> Path:
+    dest = bundle / TAILER_CONFIG_REL
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return dest
+
+
+def _as_path_list(raw) -> list[Path]:
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    out: list[Path] = []
+    for item in raw:
+        text = str(item).strip()
+        if not text or looks_like_remote(text):
+            continue
+        out.append(Path(text).expanduser())
+    return out
+
+
+def find_history_root(start: Path | None) -> Path | None:
+    """Walk up for `.okf-history`. Do not treat okf/ or a bundle as a marker."""
+    if start is None:
+        return None
+    cur = start.expanduser().resolve()
+    if cur.is_file():
+        cur = cur.parent
+    for _ in range(48):
+        marker = cur / HISTORY_MARKER
+        if marker.is_file():
+            return cur
+        if cur.parent == cur:
+            break
+        cur = cur.parent
+    return None
+
+
+def resolve_project(explicit: str | None, jsonl: Path | None) -> Path | None:
+    if explicit:
+        p = Path(explicit).expanduser()
+        return p.resolve() if p.exists() else p.expanduser()
+    env_p = (os.environ.get("OKF_PROJECT_ROOT") or "").strip()
+    if env_p and not looks_like_remote(env_p):
+        p = Path(env_p).expanduser()
+        return p.resolve() if p.exists() else p
+    cwd_hit = find_history_root(Path.cwd())
+    if cwd_hit:
+        return cwd_hit
+    if jsonl is not None:
+        return find_history_root(jsonl)
+    return None
+
+
+def _path_under(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def decide_opt_in(
+    jsonl: Path | None,
+    project: Path | None,
+    cfg: dict,
+) -> dict:
+    """Deliberate opt-in only. A bundle on disk is not enough."""
+    sessions = _as_path_list(cfg.get("opt_in_sessions"))
+    dirs = _as_path_list(cfg.get("opt_in_dirs"))
+    if jsonl is not None:
+        j = jsonl.resolve()
+        for listed in sessions:
+            try:
+                if listed.resolve() == j:
+                    return {"opted_in": True, "reason": "session", "project": str(project) if project else "", "marker": ""}
+            except OSError:
+                continue
+    proj = project
+    if proj is None and jsonl is not None:
+        proj = find_history_root(jsonl)
+    if proj is not None:
+        marker_root = find_history_root(proj)
+        if marker_root:
+            return {
+                "opted_in": True,
+                "reason": "project",
+                "project": str(marker_root),
+                "marker": str(marker_root / HISTORY_MARKER),
+            }
+        for listed in dirs:
+            try:
+                if _path_under(proj, listed) or _path_under(listed, proj):
+                    return {"opted_in": True, "reason": "project", "project": str(proj.resolve()), "marker": ""}
+            except OSError:
+                continue
+    return {"opted_in": False, "reason": "none", "project": str(proj) if proj else "", "marker": "", "hint": OPT_IN_HINT}
+
+
+def skip_not_opted_in(decision: dict, **extra) -> int:
+    payload = {
+        "ok": True,
+        "skipped": "not_opted_in",
+        "opted_in": False,
+        "opt_in_reason": decision.get("reason") or "none",
+        "hint": decision.get("hint") or OPT_IN_HINT,
+        **extra,
+    }
+    print(json.dumps(payload))
+    return 0
+
+
+def gate_or_skip(args, jsonl: Path | None, cfg: dict | None = None) -> dict | None:
+    """Return None to skip (already printed). Return decision if opted in."""
+    project = resolve_project(getattr(args, "project", "") or "", jsonl)
+    decision = decide_opt_in(jsonl, project, cfg or {})
+    if not decision.get("opted_in"):
+        skip_not_opted_in(decision, jsonl=str(jsonl) if jsonl else "")
+        return None
+    return decision
+
+
+@dataclass
+class Cursor:
+    path: str = ""
+    pos: int = 0
+    size: int = 0
+    mtime: float = 0.0
+    session_id: str = ""
+    updated_at: str = ""
+
+    def to_json(self) -> dict:
+        return {
+            "path": self.path,
+            "pos": self.pos,
+            "size": self.size,
+            "mtime": self.mtime,
+            "session_id": self.session_id,
+            "updated_at": self.updated_at,
+        }
+
+    def stale_reason(self, host: Path) -> str:
+        """Documented stale: pos/size ahead of host, or path mismatch."""
+        if self.path and Path(self.path).resolve() != host.resolve():
+            return "path does not match host jsonl"
+        try:
+            st = host.stat()
+        except OSError:
+            return "missing source"
+        if self.pos > st.st_size or self.size > st.st_size:
+            return "pos/size ahead of host size"
+        return ""
+
+
+def load_cursor(path: Path) -> Cursor:
+    if not path.exists():
+        return Cursor()
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return Cursor()
+    return Cursor(
+        path=str(data.get("path") or ""),
+        pos=int(data.get("pos") or 0),
+        size=int(data.get("size") or 0),
+        mtime=float(data.get("mtime") or 0.0),
+        session_id=str(data.get("session_id") or ""),
+        updated_at=str(data.get("updated_at") or ""),
+    )
+
+
+def save_cursor(path: Path, cursor: Cursor) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cursor.to_json(), indent=2) + "\n", encoding="utf-8")
+
+
+def snapshot_if_grew(host: Path, dest: Path) -> dict:
+    """Copy host → dest only if size/mtime grew. Never shrink dest."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    hstat = host.stat()
+    if not dest.exists():
+        dest.write_bytes(host.read_bytes())
+        try:
+            os.utime(dest, (hstat.st_atime, hstat.st_mtime))
+        except OSError:
+            pass
+        return {"copied": True, "reason": "create", "size": hstat.st_size}
+    dstat = dest.stat()
+    if hstat.st_size < dstat.st_size:
+        return {"copied": False, "reason": "never_shrink", "size": dstat.st_size}
+    grew = hstat.st_size > dstat.st_size or hstat.st_mtime > dstat.st_mtime
+    if not grew:
+        return {"copied": False, "reason": "unchanged", "size": dstat.st_size}
+    dest.write_bytes(host.read_bytes())
+    try:
+        os.utime(dest, (hstat.st_atime, hstat.st_mtime))
+    except OSError:
+        pass
+    return {"copied": True, "reason": "grew", "size": hstat.st_size}
 
 
 def open_segment_hour(session_path: Path) -> str:
@@ -426,7 +382,6 @@ def ensure_session(
     role: str,
     author: str,
     started_at: str,
-    telemetry_name: str,
 ) -> Path:
     existing = find_session(bundle, slug)
     if existing:
@@ -446,8 +401,6 @@ def ensure_session(
             "open",
             "--started-at",
             started_at,
-            "--telemetry",
-            telemetry_name,
             "--ensure-spine",
             "--title",
             slug,
@@ -463,46 +416,8 @@ def ensure_session(
     return found
 
 
-def ensure_telemetry(bundle: Path, session_path: Path, slug: str, author: str) -> Path:
-    dest = session_path.parent / f"{slug}.telemetry.md"
-    if dest.exists():
-        return dest
-    rel_session = session_path.relative_to(bundle).as_posix()
-    data = _ots_cli(
-        [
-            "write-artifact",
-            "--session",
-            rel_session,
-            "--kind",
-            "telemetry",
-            "--body",
-            "```jsonl\n```\n",
-        ],
-        bundle,
-        author,
-    )
-    if not data.get("ok") and not dest.exists():
-        ots.write_md(
-            dest,
-            {
-                "type": "temporal.telemetry",
-                "title": f"{slug} telemetry",
-                "session": session_path.name,
-                "timestamp": ots.now_iso(),
-                "author": author,
-            },
-            "```jsonl\n```\n",
-        )
-    return dest
-
-
-def rollover_to_hour(bundle: Path, slug: str, author: str, target_hour: str, telemetry_name: str) -> None:
-    """Close/open hour-aligned segments on the same slug. Never mint __002.
-
-    Uses ots_common close-segment. That helper closes the current hour, writes
-    proposed summary/saliency stubs (Haiku fill-in is a separate process), and
-    opens the next hour. Loop until the open segment hour catches the emit.
-    """
+def rollover_to_hour(bundle: Path, slug: str, author: str, target_hour: str) -> None:
+    """Close/open hour-aligned segments on the same slug. Never mint __002."""
     session = find_session(bundle, slug)
     if not session or not target_hour:
         return
@@ -519,39 +434,46 @@ def rollover_to_hour(bundle: Path, slug: str, author: str, target_hour: str, tel
                 slug,
                 "--period",
                 current,
-                "--telemetry",
-                telemetry_name,
             ],
             bundle,
             author,
         )
         if not data.get("ok"):
-            # Minimal safe behavior: keep appending to the same session/telemetry.
             return
         session = find_session(bundle, slug) or session
 
 
-def iter_host_lines(path: Path, start_pos: int):
-    """Yield (offset, line, nbytes) for complete lines starting at start_pos."""
-    with path.open("rb") as fh:
-        fh.seek(start_pos)
-        while True:
-            offset = fh.tell()
-            raw = fh.readline()
-            if not raw:
-                return
-            if not raw.endswith(b"\n"):
-                # Incomplete line in a growing file — wait for the rest.
-                return
-            yield offset, raw.decode("utf-8", errors="replace"), len(raw)
+def pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
-@dataclass
-class PendingTurn:
-    user: dict | None = None
-    assistant: dict | None = None
-    start_pos: int = 0
-    end_pos: int = 0
+def read_pid(bundle: Path) -> int | None:
+    path = bundle / PID_REL
+    if not path.exists():
+        return None
+    try:
+        pid = int(path.read_text(encoding="utf-8").strip() or "0")
+    except ValueError:
+        return None
+    return pid if pid_running(pid) else None
+
+
+def write_pid(bundle: Path, pid: int) -> None:
+    path = bundle / PID_REL
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(pid) + "\n", encoding="utf-8")
+
+
+def clear_pid(bundle: Path) -> None:
+    path = bundle / PID_REL
+    if path.exists():
+        path.unlink()
 
 
 @dataclass
@@ -568,218 +490,566 @@ class Tailer:
     idle: float
     once: bool
     cursor: Cursor = field(default_factory=Cursor)
-    turn: int = 0
-    pending: PendingTurn = field(default_factory=PendingTurn)
     session_path: Path | None = None
-    telemetry_path: Path | None = None
-    seen: set[tuple] = field(default_factory=set)
-    last_activity: float = 0.0
-    committed_pos: int = 0
-    read_pos: int = 0
-    emitted: int = 0
+    source_path: Path | None = None
+    last_growth: float = 0.0
+    copied: int = 0
 
     def setup(self) -> None:
         self.cursor = load_cursor(self.cursor_path)
-        self.committed_pos = self.cursor.pos
-        self.read_pos = self.cursor.pos
-        if self.cursor.last_turn:
-            self.turn = self.cursor.last_turn
         self.session_path = find_session(self.bundle, self.slug)
         if self.session_path:
-            self.telemetry_path = self.session_path.parent / f"{self.slug}.telemetry.md"
-            if self.telemetry_path.exists():
-                self.seen = existing_emit_keys(self.telemetry_path)
+            self.source_path = source_path_for(self.session_path, self.slug)
 
-    def _ensure_files(self, ts: str) -> None:
-        period = ots.hour_period_from_iso(ts)
-        tel_name = f"{self.slug}.telemetry.md"
+    def _period_from_host(self) -> tuple[str, str, str]:
+        first, last = flt.peek_host_bounds(self.jsonl)
+        started = first or now_iso()
+        ended = last or started
+        period = ots.hour_period_from_iso(started)
+        return period, started, ended
+
+    def _ensure_hub(self) -> None:
+        period, started, last = self._period_from_host()
         self.session_path = ensure_session(
-            self.bundle, self.slug, period, self.agent, self.role, self.author, ts, tel_name
+            self.bundle, self.slug, period, self.agent, self.role, self.author, started
         )
-        self.telemetry_path = ensure_telemetry(self.bundle, self.session_path, self.slug, self.author)
-        self.seen |= existing_emit_keys(self.telemetry_path)
+        self.source_path = source_path_for(self.session_path, self.slug)
+        last_hour = ots.hour_period_from_iso(last)
+        rollover_to_hour(self.bundle, self.slug, self.author, last_hour)
 
-    def _should_skip_emit(self, obj: dict) -> bool:
-        key = (obj.get("session_id"), obj.get("turn"), obj.get("role"))
-        if key in self.seen:
-            return True
-        offset = obj.get("source_offset")
-        if self.cursor.already_emitted(obj["session_id"], obj["turn"], obj["role"], offset if isinstance(offset, int) else None):
-            return True
-        return False
-
-    def _write_emit(self, obj: dict) -> bool:
-        errors = validate_emit(obj)
-        if errors:
-            return False
-        if self._should_skip_emit(obj):
-            return False
-        assert self.telemetry_path is not None
-        hour = ots.hour_period_from_iso(obj["ts"])
-        rollover_to_hour(self.bundle, self.slug, self.author, hour, f"{self.slug}.telemetry.md")
-        append_emit_line(self.telemetry_path, obj)
-        self.seen.add((obj["session_id"], obj["turn"], obj["role"]))
-        self.cursor.last_session_id = obj["session_id"]
-        self.cursor.last_turn = obj["turn"]
-        self.cursor.last_role = obj["role"]
-        if isinstance(obj.get("source_offset"), int):
-            self.cursor.source_offset = obj["source_offset"]
-        return True
-
-    def flush(self, commit_pos: int | None = None) -> int:
-        """Idle/EOF flush: prompt then final assistant response."""
-        wrote = 0
-        if self.pending.user:
-            self._ensure_files(self.pending.user["ts"])
-            if self._write_emit(self.pending.user):
-                wrote += 1
-        if self.pending.assistant:
-            self._ensure_files(self.pending.assistant["ts"])
-            if self._write_emit(self.pending.assistant):
-                wrote += 1
-        self.pending = PendingTurn()
-        self.committed_pos = self.read_pos if commit_pos is None else commit_pos
-        self.cursor.pos = self.committed_pos
-        self.cursor.source_path = self.jsonl.as_posix()
+    def flush(self) -> dict:
+        self._ensure_hub()
+        assert self.source_path is not None
+        snap = snapshot_if_grew(self.jsonl, self.source_path)
+        if snap["copied"]:
+            self.copied += 1
+            self.last_growth = time.monotonic()
+        st = self.jsonl.stat()
+        self.cursor = Cursor(
+            path=self.jsonl.as_posix(),
+            pos=st.st_size,
+            size=st.st_size,
+            mtime=st.st_mtime,
+            session_id=self.slug,
+            updated_at=now_iso(),
+        )
         save_cursor(self.cursor_path, self.cursor)
-        self.emitted += wrote
-        return wrote
-
-    def _flush_if_complete_pair(self) -> None:
-        if self.pending.user and self.pending.assistant:
-            self.flush()
-
-    def ingest_event(self, event: HostEvent, next_pos: int) -> None:
-        if event.tool_result:
-            self.read_pos = next_pos
-            if not self.pending.user:
-                self.committed_pos = next_pos
-                self.cursor.pos = next_pos
-                self.cursor.source_path = self.jsonl.as_posix()
-                save_cursor(self.cursor_path, self.cursor)
-            return
-        if event.role == "user" and event.text:
-            if self.pending.user:
-                self.flush()
-            self.turn += 1
-            self.pending = PendingTurn(start_pos=event.offset, end_pos=next_pos)
-            self.pending.user = build_emit(
-                ts=event.ts,
-                host=self.host,
-                session_id=self.slug,
-                actor=self.actor,
-                turn=self.turn,
-                role="user",
-                text=event.text,
-                source_path=self.jsonl.as_posix(),
-                source_offset=event.offset,
-            )
-            self.read_pos = next_pos
-            self.last_activity = time.monotonic()
-            return
-        if event.role == "assistant":
-            if event.text and self.pending.user:
-                self.pending.assistant = build_emit(
-                    ts=event.ts,
-                    host=self.host,
-                    session_id=self.slug,
-                    actor=self.actor,
-                    turn=self.turn,
-                    role="assistant",
-                    text=event.text,
-                    model=event.model,
-                    source_path=self.jsonl.as_posix(),
-                    source_offset=event.offset,
-                )
-            self.read_pos = next_pos
-            self.last_activity = time.monotonic()
-
-    def drain(self) -> int:
-        n = 0
-        for offset, line, nbytes in iter_host_lines(self.jsonl, self.read_pos):
-            next_pos = offset + nbytes
-            event = parse_host_record(line, offset)
-            if event is None:
-                self.read_pos = next_pos
-                if not self.pending.user:
-                    self.committed_pos = next_pos
-                    self.cursor.pos = next_pos
-                    self.cursor.source_path = self.jsonl.as_posix()
-                    save_cursor(self.cursor_path, self.cursor)
-                continue
-            self.ingest_event(event, next_pos)
-            n += 1
-        return n
+        return snap
 
     def run(self) -> dict:
         self.setup()
-        self.last_activity = time.monotonic()
+        self.last_growth = time.monotonic()
         while True:
-            self.drain()
             if self.once:
-                self.flush()
+                snap = self.flush()
                 break
-            if self.pending.user and self.pending.assistant and (time.monotonic() - self.last_activity) >= self.idle:
-                self.flush()
+            # Architect lock: refresh on idle + size/mtime growth. Not every-second mirror.
+            hstat = self.jsonl.stat()
+            dest = self.source_path
+            grew = True
+            if dest is not None and dest.exists():
+                dstat = dest.stat()
+                if hstat.st_size < dstat.st_size:
+                    grew = False
+                else:
+                    grew = hstat.st_size > dstat.st_size or hstat.st_mtime > dstat.st_mtime
+            if grew:
+                self.last_growth = time.monotonic()
+                self._pending_growth = True
+            pending = getattr(self, "_pending_growth", False)
+            if pending and (time.monotonic() - self.last_growth) >= self.idle:
+                snap = self.flush()
+                self._pending_growth = False
+            else:
+                snap = {"copied": False, "reason": "waiting_idle" if pending else "unchanged"}
             time.sleep(DEFAULT_POLL)
         return {
             "ok": True,
             "session": self.slug,
-            "telemetry": str(self.telemetry_path) if self.telemetry_path else "",
+            "source": str(self.source_path) if self.source_path else "",
             "cursor": str(self.cursor_path),
-            "emitted": self.emitted,
+            "copied": self.copied,
+            "snapshot": snap,
             "pos": self.cursor.pos,
+            "size": self.cursor.size,
         }
+
+
+def merge_runtime_args(args, bundle: Path | None) -> None:
+    """Fill missing CLI fields from okf/temporal/tailer.json. No remotes."""
+    cfg = load_tailer_config(bundle) if bundle is not None else {}
+    if not getattr(args, "jsonl", "") and (cfg.get("jsonl") or cfg.get("source")):
+        args.jsonl = str(cfg.get("jsonl") or cfg.get("source"))
+    if not getattr(args, "author", "") and cfg.get("identity"):
+        args.author = str(cfg["identity"])
+    if not getattr(args, "host", None) or args.host == "claude-code":
+        if cfg.get("host"):
+            args.host = str(cfg["host"])
+    if not getattr(args, "role", "") and cfg.get("role"):
+        args.role = str(cfg["role"])
+    if not getattr(args, "agent", "") and cfg.get("agent"):
+        args.agent = str(cfg["agent"])
+    if getattr(args, "n", 1) == 1 and cfg.get("n"):
+        try:
+            args.n = int(cfg["n"])
+        except (TypeError, ValueError):
+            pass
+    if getattr(args, "idle", DEFAULT_IDLE) == DEFAULT_IDLE and cfg.get("idle_seconds") is not None:
+        try:
+            args.idle = float(cfg["idle_seconds"])
+        except (TypeError, ValueError):
+            pass
+    if not getattr(args, "cursor", "") and cfg.get("cursor"):
+        args.cursor = str(cfg["cursor"])
+
+
+def resolve_cursor_path(raw: str, bundle: Path, jsonl: Path | None) -> Path:
+    if raw:
+        p = Path(raw)
+        return p if p.is_absolute() else (bundle / p)
+    return bundle / CURSOR_REL
+
+
+def build_tailer(args) -> Tailer:
+    bundle = require_bundle(args.bundle)
+    merge_runtime_args(args, bundle)
+    jsonl = require_jsonl(getattr(args, "jsonl", ""))
+    author, actor = require_identity(getattr(args, "author", ""))
+    role = (getattr(args, "role", "") or "").strip()
+    agent = (getattr(args, "agent", "") or "").strip()
+    if not role or not agent:
+        raise SystemExit(fail("missing agent", hint="pass --role and --agent or run setup"))
+    slug = session_slug(role, agent, int(getattr(args, "n", 1) or 1))
+    cursor_path = resolve_cursor_path(getattr(args, "cursor", "") or "", bundle, jsonl)
+    return Tailer(
+        jsonl=jsonl,
+        bundle=bundle,
+        cursor_path=cursor_path,
+        host=getattr(args, "host", "claude-code") or "claude-code",
+        slug=slug,
+        agent=agent.strip().lower().replace("-", "_"),
+        role=role.strip().lower().replace("-", "_"),
+        author=author,
+        actor=actor,
+        idle=float(getattr(args, "idle", DEFAULT_IDLE) or DEFAULT_IDLE),
+        once=True,
+    )
+
+
+def _peek_cfg(args) -> dict:
+    bundle = peek_bundle(getattr(args, "bundle", ""))
+    if bundle is None:
+        return {}
+    merge_runtime_args(args, bundle)
+    return load_tailer_config(bundle)
+
+
+def cmd_once(args) -> int:
+    cfg = _peek_cfg(args)
+    jsonl = require_jsonl(getattr(args, "jsonl", ""))
+    if gate_or_skip(args, jsonl, cfg) is None:
+        return 0
+    tailer = build_tailer(args)
+    tailer.once = True
+    print(json.dumps(tailer.run()))
+    return 0
+
+
+def cmd_follow(args) -> int:
+    cfg = _peek_cfg(args)
+    jsonl = require_jsonl(getattr(args, "jsonl", ""))
+    if gate_or_skip(args, jsonl, cfg) is None:
+        return 0
+    tailer = build_tailer(args)
+    tailer.once = False
+    print(json.dumps(tailer.run()))
+    return 0
+
+
+def cmd_start(args) -> int:
+    cfg = _peek_cfg(args)
+    jsonl = require_jsonl(getattr(args, "jsonl", ""))
+    if gate_or_skip(args, jsonl, cfg) is None:
+        return 0
+    bundle = require_bundle(args.bundle)
+    merge_runtime_args(args, bundle)
+    require_identity(getattr(args, "author", ""))
+    running = read_pid(bundle)
+    if running:
+        return fail("already running", pid=running)
+    child = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "follow",
+        "--jsonl",
+        str(jsonl),
+        "--bundle",
+        str(bundle),
+        "--host",
+        getattr(args, "host", "claude-code") or "claude-code",
+        "--role",
+        args.role,
+        "--agent",
+        args.agent,
+        "--n",
+        str(getattr(args, "n", 1) or 1),
+        "--idle",
+        str(getattr(args, "idle", DEFAULT_IDLE) or DEFAULT_IDLE),
+    ]
+    if getattr(args, "author", ""):
+        child += ["--author", args.author]
+    if getattr(args, "cursor", ""):
+        child += ["--cursor", args.cursor]
+    if getattr(args, "project", ""):
+        child += ["--project", args.project]
+    log = bundle / "okf" / "temporal" / ".ots-tail.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    fh = log.open("ab")
+    proc = subprocess.Popen(
+        child,
+        stdout=fh,
+        stderr=fh,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        env=os.environ.copy(),
+    )
+    write_pid(bundle, proc.pid)
+    print(json.dumps({"ok": True, "pid": proc.pid, "log": str(log)}))
+    return 0
+
+
+def cmd_stop(args) -> int:
+    bundle = require_bundle(args.bundle, must_exist=True)
+    pid = read_pid(bundle)
+    stored = bundle / PID_REL
+    if stored.exists() and pid is None:
+        try:
+            stale = int(stored.read_text(encoding="utf-8").strip() or "0")
+        except ValueError:
+            stale = 0
+        clear_pid(bundle)
+        print(json.dumps({"ok": True, "stopped": False, "stale_pid": stale}))
+        return 0
+    if pid is None:
+        return fail("not running")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except OSError as exc:
+        clear_pid(bundle)
+        return fail("stop failed", detail=str(exc))
+    clear_pid(bundle)
+    print(json.dumps({"ok": True, "stopped": True, "pid": pid}))
+    return 0
+
+
+def cmd_status(args) -> int:
+    try:
+        bundle = require_bundle(args.bundle)
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 1
+    merge_runtime_args(args, bundle)
+    pid = read_pid(bundle)
+    cfg = load_tailer_config(bundle)
+    jsonl_raw = getattr(args, "jsonl", "") or cfg.get("jsonl") or ""
+    cursor_path = resolve_cursor_path(getattr(args, "cursor", "") or "", bundle, None)
+    cursor = load_cursor(cursor_path)
+    session = None
+    source = ""
+    slug = cursor.session_id
+    if not slug and getattr(args, "role", "") and getattr(args, "agent", ""):
+        slug = session_slug(args.role, args.agent, int(getattr(args, "n", 1) or 1))
+    if slug:
+        session_path = find_session(bundle, slug)
+        if session_path:
+            session = str(session_path)
+            src = source_path_for(session_path, slug)
+            if src.exists():
+                source = str(src)
+    jsonl_path = Path(jsonl_raw).expanduser() if jsonl_raw else None
+    if jsonl_path and not jsonl_path.exists():
+        jsonl_path = None
+    decision = decide_opt_in(jsonl_path, resolve_project(getattr(args, "project", "") or "", jsonl_path), cfg)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "running": pid is not None,
+                "pid": pid,
+                "jsonl": jsonl_raw,
+                "source": source,
+                "session": slug or "",
+                "session_path": session or "",
+                "cursor": cursor.to_json(),
+                "cursor_path": str(cursor_path),
+                "opted_in": bool(decision.get("opted_in")),
+                "opt_in_reason": decision.get("reason") or "none",
+                "skipped": None if decision.get("opted_in") else "not_opted_in",
+            }
+        )
+    )
+    return 0
+
+
+def cmd_check(args) -> int:
+    try:
+        _author, _actor = require_identity(getattr(args, "author", ""))
+        bundle = require_bundle(args.bundle)
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 1
+    merge_runtime_args(args, bundle)
+    try:
+        jsonl = require_jsonl(getattr(args, "jsonl", ""))
+    except SystemExit as e:
+        return int(e.code) if isinstance(e.code, int) else 1
+    cursor_path = resolve_cursor_path(getattr(args, "cursor", "") or "", bundle, jsonl)
+    cursor = load_cursor(cursor_path)
+    if cursor.path or cursor.pos or cursor.size:
+        reason = cursor.stale_reason(jsonl)
+        if reason:
+            return fail("cursor stale", reason=reason, cursor=cursor.to_json())
+    cfg = load_tailer_config(bundle)
+    decision = decide_opt_in(jsonl, resolve_project(getattr(args, "project", "") or "", jsonl), cfg)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "source": str(jsonl),
+                "cursor": cursor.to_json(),
+                "opted_in": bool(decision.get("opted_in")),
+                "opt_in_reason": decision.get("reason") or "none",
+                "skipped": None if decision.get("opted_in") else "not_opted_in",
+                "hint": None if decision.get("opted_in") else OPT_IN_HINT,
+            }
+        )
+    )
+    return 0
+
+
+def cmd_setup(args) -> int:
+    bundle = require_bundle(args.bundle, must_exist=False)
+    jsonl_raw = (getattr(args, "jsonl", "") or "").strip()
+    if jsonl_raw and looks_like_remote(jsonl_raw):
+        return fail("do not hard-code a remote", hint="use a local host JSONL path")
+    if jsonl_raw:
+        p = Path(jsonl_raw)
+        if not p.exists():
+            return fail("missing source", path=jsonl_raw)
+        jsonl_raw = str(p.resolve())
+    role = (getattr(args, "role", "") or "software_engineer").strip()
+    agent = (getattr(args, "agent", "") or "local").strip()
+    host = getattr(args, "host", "claude-code") or "claude-code"
+    n = int(getattr(args, "n", 1) or 1)
+    idle = float(getattr(args, "idle", DEFAULT_IDLE) or DEFAULT_IDLE)
+    cursor = getattr(args, "cursor", "") or CURSOR_REL.as_posix()
+    identity = (getattr(args, "identity", "") or getattr(args, "author", "") or "local/tailer").strip()
+    edition = (getattr(args, "edition", "") or "").strip().lower()
+    model = (getattr(args, "model", "") or "").strip()
+    data = {
+        "v": 1,
+        "identity": identity,
+        "host": host,
+        "source": jsonl_raw,
+        "jsonl": jsonl_raw,
+        "role": role,
+        "agent": agent,
+        "n": n,
+        "idle": idle,
+        "idle_seconds": idle,
+        "cursor": cursor,
+    }
+    if edition:
+        if edition not in {"a", "b"}:
+            return fail("edition must be a or b")
+        try:
+            extra = editions.edition_config_fields(host, edition, identity=identity)
+        except ValueError as exc:
+            return fail(str(exc))
+        if edition == "a":
+            check = editions.verify_edition_a(host, model or extra["model"])
+        else:
+            check = editions.verify_edition_b(
+                host,
+                model=model or extra["model"],
+                provider=getattr(args, "provider", "") or extra.get("provider") or "",
+                api_key_env=getattr(args, "api_key_env", "") or extra.get("api_key_env") or "",
+            )
+        if not check.get("ok"):
+            print(json.dumps(check))
+            return 1
+        data.update(extra)
+        if model:
+            data["model"] = extra["model"]
+    existing = load_tailer_config(bundle)
+    for key in ("opt_in_sessions", "opt_in_dirs"):
+        if existing.get(key) and key not in data:
+            data[key] = existing[key]
+    project_raw = (getattr(args, "project", "") or "").strip()
+    if project_raw and not looks_like_remote(project_raw):
+        proj = Path(project_raw).expanduser()
+        proj.mkdir(parents=True, exist_ok=True)
+        marker = proj / HISTORY_MARKER
+        if not marker.exists():
+            marker.write_text("", encoding="utf-8")
+        dirs = [str(x.resolve()) if x.exists() else str(Path(x).expanduser()) for x in _as_path_list(data.get("opt_in_dirs"))]
+        resolved = str(proj.resolve())
+        if resolved not in dirs:
+            dirs.append(resolved)
+        data["opt_in_dirs"] = dirs
+    dest = write_tailer_config(bundle, data)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "path": str(dest),
+                "config": data,
+                "opt_in": {
+                    "project": f"touch {HISTORY_MARKER} in the project root, or ots-tail opt-in --project <dir>",
+                    "session": "ots-tail opt-in --jsonl <transcript.jsonl>",
+                    "note": "install is not capture; a second-brain bundle on disk is not opt-in",
+                },
+            }
+        )
+    )
+    return 0
+
+
+def cmd_opt_in(args) -> int:
+    """Deliberate project marker and/or session transcript allow-list."""
+    jsonl_raw = (getattr(args, "jsonl", "") or "").strip()
+    project_raw = (getattr(args, "project", "") or "").strip()
+    if jsonl_raw and looks_like_remote(jsonl_raw):
+        return fail("do not hard-code a remote")
+    if project_raw and looks_like_remote(project_raw):
+        return fail("do not hard-code a remote")
+    if not jsonl_raw and not project_raw:
+        project_raw = str(Path.cwd())
+    marker = ""
+    if project_raw:
+        proj = Path(project_raw).expanduser()
+        proj.mkdir(parents=True, exist_ok=True)
+        dest = proj / HISTORY_MARKER
+        if not dest.exists():
+            dest.write_text("", encoding="utf-8")
+        marker = str(dest.resolve())
+    bundle = peek_bundle(getattr(args, "bundle", ""))
+    if bundle is None and (jsonl_raw or getattr(args, "bundle", "") or os.environ.get("SECOND_BRAIN_ROOT")):
+        bundle = require_bundle(args.bundle, must_exist=False)
+    cfg = load_tailer_config(bundle) if bundle else {}
+    if jsonl_raw:
+        p = Path(jsonl_raw)
+        if not p.exists() or not p.is_file():
+            return fail("missing source", path=jsonl_raw)
+        sessions = [str(x.resolve()) for x in _as_path_list(cfg.get("opt_in_sessions"))]
+        resolved = str(p.resolve())
+        if resolved not in sessions:
+            sessions.append(resolved)
+        cfg["opt_in_sessions"] = sessions
+    if project_raw and bundle is not None:
+        dirs = [str(x.resolve()) if x.exists() else str(Path(x).expanduser()) for x in _as_path_list(cfg.get("opt_in_dirs"))]
+        resolved = str(Path(project_raw).expanduser().resolve())
+        if resolved not in dirs:
+            dirs.append(resolved)
+        cfg["opt_in_dirs"] = dirs
+    path = str(write_tailer_config(bundle, cfg)) if bundle is not None and (jsonl_raw or project_raw) else ""
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "opted_in": True,
+                "marker": marker,
+                "jsonl": str(Path(jsonl_raw).resolve()) if jsonl_raw else "",
+                "config": path,
+            }
+        )
+    )
+    return 0
+
+
+def cmd_opt_out(args) -> int:
+    jsonl_raw = (getattr(args, "jsonl", "") or "").strip()
+    project_raw = (getattr(args, "project", "") or "").strip()
+    if not jsonl_raw and not project_raw:
+        return fail("pass --jsonl and/or --project to opt-out")
+    removed_marker = ""
+    if project_raw:
+        marker = Path(project_raw).expanduser() / HISTORY_MARKER
+        if marker.is_file():
+            marker.unlink()
+            removed_marker = str(marker)
+    bundle = peek_bundle(getattr(args, "bundle", ""))
+    cfg = load_tailer_config(bundle) if bundle else {}
+    if jsonl_raw and bundle:
+        drop = str(Path(jsonl_raw).expanduser().resolve())
+        cfg["opt_in_sessions"] = [s for s in (cfg.get("opt_in_sessions") or []) if str(Path(s).expanduser().resolve()) != drop]
+    if project_raw and bundle:
+        drop = str(Path(project_raw).expanduser().resolve())
+        cfg["opt_in_dirs"] = [s for s in (cfg.get("opt_in_dirs") or []) if str(Path(s).expanduser().resolve()) != drop]
+    if bundle is not None and (jsonl_raw or project_raw):
+        write_tailer_config(bundle, cfg)
+    print(json.dumps({"ok": True, "opted_in": False, "removed_marker": removed_marker}))
+    return 0
+
+
+def add_common_flags(p: argparse.ArgumentParser, *, require_agent: bool = False) -> None:
+    p.add_argument("--jsonl", default="", help="host session JSONL (read-only)")
+    p.add_argument("--bundle", default="", help="OKF bundle; default SECOND_BRAIN_ROOT")
+    p.add_argument("--author", default="", help="process author (default local/tailer once identity is claimed)")
+    p.add_argument("--host", default="claude-code", choices=HOSTS)
+    p.add_argument("--role", default="", required=require_agent, help="session agent role (slug)")
+    p.add_argument("--agent", default="", required=require_agent, help="session agent name (slug)")
+    p.add_argument("--n", type=int, default=1, help="session ordinal, default 1 → __001")
+    p.add_argument("--idle", type=float, default=DEFAULT_IDLE, help="idle flush seconds (default 300)")
+    p.add_argument("--cursor", default="", help="cursor file; default okf/temporal/.ots-cursor.json")
+    p.add_argument("--identity", default="", help="process identity written to tailer.json (default local/tailer)")
+    p.add_argument("--edition", default="", choices=["a", "b"], help="summarize edition (setup)")
+    p.add_argument("--model", default="", help="must match the pinned cheapest model for --host")
+    p.add_argument("--provider", default="", help="edition b provider (anthropic|openai|xai)")
+    p.add_argument("--api-key-env", dest="api_key_env", default="", help="edition b key env name")
+    p.add_argument("--project", default="", help="project root to test for .okf-history (not inferred from a bundle)")
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ots_tail_jsonl.py",
-        description="Official host-JSONL → temporal.telemetry tailer (no LLM).",
+        description="Copy host JSONL → sessions/<slug>.source.jsonl (no LLM, no stored emit schema).",
     )
-    p.add_argument("--jsonl", required=True, help="host session JSONL (read-only)")
-    p.add_argument("--bundle", default="", help="OKF bundle; default SECOND_BRAIN_ROOT")
-    p.add_argument("--author", default="", help="process author (default local/tailer once identity is claimed)")
-    p.add_argument("--host", default="claude-code", choices=HOSTS)
-    p.add_argument("--role", required=True, help="session agent role (slug)")
-    p.add_argument("--agent", required=True, help="session agent name (slug)")
-    p.add_argument("--n", type=int, default=1, help="session ordinal, default 1 → __001")
-    p.add_argument("--idle", type=float, default=DEFAULT_IDLE, help="seconds of quiet before flushing a pair (--follow)")
-    p.add_argument("--cursor", default="", help="cursor file; default <jsonl>.ots-cursor.json")
-    p.add_argument("--once", action="store_true", help="drain to EOF then exit")
-    p.add_argument("--follow", action="store_true", help="long-running (default unless --once)")
+    p.add_argument("--once", action="store_true", help="compat: drain once (same as subcommand once)")
+    p.add_argument("--follow", action="store_true", help="compat: long-running foreground")
+    add_common_flags(p)
+    sub = p.add_subparsers(dest="cmd")
+    for name in ("once", "follow", "start", "stop", "status", "check", "setup", "opt-in", "opt-out"):
+        sp = sub.add_parser(name)
+        add_common_flags(sp)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    cmd = args.cmd
     if args.follow and args.once:
         return fail("use --once or --follow, not both")
-    once = bool(args.once)
+    if not cmd:
+        if args.once:
+            cmd = "once"
+        elif args.follow:
+            cmd = "follow"
+        else:
+            return fail("missing command", hint="once|follow|start|stop|status|check|setup|opt-in|opt-out")
+    handlers = {
+        "once": cmd_once,
+        "follow": cmd_follow,
+        "start": cmd_start,
+        "stop": cmd_stop,
+        "status": cmd_status,
+        "check": cmd_check,
+        "setup": cmd_setup,
+        "opt-in": cmd_opt_in,
+        "opt-out": cmd_opt_out,
+    }
     try:
-        bundle = require_bundle(args.bundle)
-        jsonl = require_jsonl(args.jsonl)
-        author, actor = require_identity(args.author)
+        return handlers[cmd](args)
     except SystemExit as e:
         return int(e.code) if isinstance(e.code, int) else 1
-    slug = session_slug(args.role, args.agent, args.n)
-    cursor_path = Path(args.cursor) if args.cursor else Path(str(jsonl) + ".ots-cursor.json")
-    tailer = Tailer(
-        jsonl=jsonl,
-        bundle=bundle,
-        cursor_path=cursor_path,
-        host=args.host,
-        slug=slug,
-        agent=args.agent.strip().lower().replace("-", "_"),
-        role=args.role.strip().lower().replace("-", "_"),
-        author=author,
-        actor=actor,
-        idle=args.idle,
-        once=once,
-    )
-    result = tailer.run()
-    print(json.dumps(result))
-    return 0
 
 
 if __name__ == "__main__":

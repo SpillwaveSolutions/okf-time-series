@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "Telemetry.schema.json",
   "title": "temporal.telemetry",
-  "description": "Frontmatter only. Body JSONL convention: TELEMETRY_EMIT.md",
+  "description": "Optional / deferred in phase 1. Frontmatter only. Bundle source of truth is sessions/<slug>.source.jsonl. Read-time filter: docs/TELEMETRY_EMIT.md (not stored).",
   "type": "object",
   "required": [
     "type",

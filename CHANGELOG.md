@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 — 2026-09-12
+
+- Snapshot-first capture: `sessions/<slug>.source.jsonl` is the immutable vendor JSONL copy. No stored `TELEMETRY_EMIT` write schema.
+- `ots_tail_jsonl.py` commands: `once` / `follow` / `start` / `stop` / `status` / `check` / `setup`. Cursor is `path`, `pos` or `size`/`mtime`, `session_id`, `updated_at`. Replace snapshot only if size/mtime grew; never shrink. Idle flush default 300s.
+- `write-session --ensure-spine` confirmed for the tailer hub. Same slug across hours; `close-segment` on rollover.
+- `TELEMETRY_EMIT` moved to `docs/TELEMETRY_EMIT.md` as the **read-time** filter for summarization (user prompt + final assistant; skip `tool_result`). Not stored.
+- `ots summarize --period` reads the snapshot, applies the filter, writes `.summary.md` / `.saliency.md`, and does not touch `.source.jsonl`. Edition A (pinned host CLI) or Edition B (verified API key). No silent fallback. Tests use explicit `--stub` / `--model-cmd`.
+- Setup `--edition a` fails if the host CLI is missing or the model is not the pin; `--edition b` fails if the key env is unset.
+- `ots sessions list|show` and `ots summarize --status` show source/summary/saliency presence and excerpts. `ots print-cron` prints suggested crontab lines (user scheduler; not an in-pack queue).
+- Setup writes `okf/temporal/tailer.json` in the bundle (optional `~/.okf/ots-tail.json` overlay). No private remotes. Phase-1 PRD: `docs/PRD-TELEMETRY-PHASE1.md`. `.telemetry.md` omitted in phase 1.
+- Capture is opt-in. `.okf-history` (project) or `ots-tail opt-in` (session). No marker → skip entirely (no snapshot/hub/cursor). A bundle on disk is not opt-in. `check`/`status` report skipped vs opted-in.
+
 ## 0.3.1 — 2026-09-12
 
 - Phase-1 telemetry emit body contract: `schemas/okf-temporal/TELEMETRY_EMIT.md` (`v`, `ts`, `host`, `session_id`, `actor`, `turn`, `role`, `text`). Frontmatter unchanged.
