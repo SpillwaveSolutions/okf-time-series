@@ -71,7 +71,7 @@ Canonical path: bundle **`okf/temporal/tailer.json`**. Optional machine overlay:
 
 Edition B adds `provider` and `api_key_env`. Dogfood slug: `software_engineer__local__001`.
 
-Idle flush default is 300 seconds. No host hooks. No LLM in the tailer. `worked_during` is not in this PR.
+Idle flush default is 300 seconds. Dogfood may pass `--idle 60` if the follow loop stalls; do not change the default unless asked. No host hooks. No LLM in the tailer. `worked_during` is not in this PR.
 
 ## Opt-in is the capture gate
 
@@ -82,4 +82,6 @@ Install ≠ capture. Both checks run **before** any snapshot, hub, or cursor wri
 
 No marker and no session opt-in → **skip entirely**. Nothing written. Do **not** infer opt-in from “this directory already has an OKF / second-brain bundle.”
 
-`ots-tail check` / `status` report `opted_in` and `skipped: not_opted_in`. Wizard documents `touch .okf-history` and `ots-tail opt-in`. Dogfood one project first; add dirs as trust grows.
+`ots-tail check` / `status` report `opted_in` and `skipped: not_opted_in`. When skipped, they print the absolute `.okf-history` candidates walked plus `jsonl` / `session_id`. `check` exits 1 if not opted in. Wizard documents `touch .okf-history` and `ots-tail opt-in`. Dogfood one project first; add dirs as trust grows.
+
+`ots smoke` runs `check && once && tick-hour && summarize --period … --stub && check` against fixtures.

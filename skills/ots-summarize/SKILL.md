@@ -18,7 +18,7 @@ Edition A (no API key) always passes the pinned cheapest model:
 - Codex: `codex exec -m gpt-5.6-luna`
 - Grok Build: `grok --model grok-4-fast -p`
 
-Missing CLI or wrong model fails loudly. No silent fallback to Edition B.
+Missing CLI or wrong model fails loudly. Sonnet / Sol / Terra / any non-pin fails closed. Never use the session default. No silent fallback to Edition B.
 
 Edition B: `ANTHROPIC_API_KEY` → `claude-haiku-4-5`; `OPENAI_API_KEY` → `gpt-5.6-luna`. Same prompt and files.
 

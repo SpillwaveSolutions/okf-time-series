@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import urllib.error
@@ -27,6 +28,10 @@ MACHINE_CONFIG = Path.home() / ".okf" / "ots-tail.json"
 REMOTE_PREFIXES = ("http://", "https://", "git@", "ssh://")
 
 # Wizard-pinned cheapest model per host. Setup writes these; summarize uses them.
+# High / session-default names must never be written. Fail closed.
+HIGH_MODEL_MARKERS = ("sonnet", "opus", "terra")
+HIGH_MODEL_TOKEN = re.compile(r"(^|[-_/.])sol($|[-_/.])")
+
 HOST_PINS = {
     "claude-code": {
         "bin": "claude",
@@ -77,6 +82,38 @@ def pin_for(host: str) -> dict:
     if not pin:
         raise ValueError(f"unknown host: {host}")
     return dict(pin)
+
+
+def model_is_high(model: str | None) -> bool:
+    """True for Sonnet / Opus / Sol / Terra / other non-cheap session defaults."""
+    text = (model or "").strip().lower()
+    if not text:
+        return False
+    if any(marker in text for marker in HIGH_MODEL_MARKERS):
+        return True
+    return bool(HIGH_MODEL_TOKEN.search(text))
+
+
+def reject_non_pin_model(host: str, model: str | None) -> dict | None:
+    """Return an error payload if `model` is present and is not the host pin.
+
+    Empty model means setup will write the pin (never the session default).
+    """
+    if not (model or "").strip():
+        return None
+    pin = pin_for(host)
+    wanted = pin["model"]
+    got = model.strip()
+    if got == wanted:
+        return None
+    error = "high model rejected" if model_is_high(got) else "wrong model"
+    return {
+        "ok": False,
+        "error": error,
+        "wanted": wanted,
+        "got": got,
+        "hint": "Edition A must pin the cheapest model; never the session default",
+    }
 
 
 def _read_json(path: Path) -> dict:
@@ -135,8 +172,10 @@ def verify_edition_a(host: str, model: str | None = None, *, which=shutil.which,
     """Fail loudly if the host CLI is missing or the pinned model is wrong."""
     pin = pin_for(host)
     wanted = pin["model"]
-    if model and model != wanted:
-        return {"ok": False, "error": "wrong model", "wanted": wanted, "got": model, "edition": "a"}
+    rejected = reject_non_pin_model(host, model)
+    if rejected:
+        rejected["edition"] = "a"
+        return rejected
     binary = which(pin["bin"])
     if not binary:
         return {"ok": False, "error": "cli missing", "bin": pin["bin"], "edition": "a", "hint": "install the host CLI or use setup --edition b with a verified key"}
@@ -158,8 +197,10 @@ def verify_edition_a(host: str, model: str | None = None, *, which=shutil.which,
 def verify_edition_b(host: str, model: str | None = None, provider: str = "", api_key_env: str = "", env: dict | None = None) -> dict:
     pin = pin_for(host)
     wanted = pin["model"]
-    if model and model != wanted:
-        return {"ok": False, "error": "wrong model", "wanted": wanted, "got": model, "edition": "b"}
+    rejected = reject_non_pin_model(host, model)
+    if rejected:
+        rejected["edition"] = "b"
+        return rejected
     key_env = api_key_env or pin["api_key_env"]
     prov = provider or pin["provider"]
     environ = env if env is not None else os.environ

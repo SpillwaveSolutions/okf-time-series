@@ -157,10 +157,18 @@ class TestOts(unittest.TestCase):
             ids,
             {
                 "software_engineer__atlas__001",
-                "software_engineer__atlas__002",
                 "research__lumen__001",
             },
         )
+        self.assertFalse(any(n["id"] == "software_engineer__atlas__002" for n in sessions))
+        leftover = [p for p in sample.rglob("*atlas__002*") if p.is_file()]
+        self.assertFalse(leftover, leftover)
+        sample_text = (sample / "okf/temporal/2026/08/21/14/sessions/software_engineer__atlas__001.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("2026-08-21T15", sample_text)
+        self.assertTrue(list(sample.rglob("software_engineer__atlas__001.source.jsonl")))
+        self.assertFalse(list(sample.rglob("*.telemetry.md")))
 
     def test_write_session_ensure_spine_creates_parents(self):
         author = ["--author", "grok-bot/northstar-console"]

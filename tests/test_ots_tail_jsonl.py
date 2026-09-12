@@ -256,7 +256,17 @@ class TestTailerOnceAndCursor(unittest.TestCase):
         self.assertIn("identity", ident.stdout.lower())
 
         ok = run_tail(
-            ["check", "--jsonl", str(FIXTURE), "--author", "local/tailer", "--cursor", str(self.cursor)],
+            [
+                "check",
+                "--jsonl",
+                str(FIXTURE),
+                "--author",
+                "local/tailer",
+                "--cursor",
+                str(self.cursor),
+                "--project",
+                str(self.project),
+            ],
             env=self.env,
             bundle=str(self.bundle),
         )
@@ -511,6 +521,62 @@ class TestEditionsAndInspect(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("wrong model", r.stdout.lower())
 
+    def test_setup_rejects_high_model_sonnet(self):
+        env = dict(self.env)
+        env["PATH"] = str(self._fake_cli()) + os.pathsep + env.get("PATH", "")
+        r = run_tail(
+            [
+                "setup",
+                "--edition",
+                "a",
+                "--host",
+                "claude-code",
+                "--model",
+                "claude-sonnet-4-5",
+                "--jsonl",
+                str(FIXTURE),
+                "--role",
+                "software_engineer",
+                "--agent",
+                "local",
+            ],
+            env=env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(r.returncode, 1)
+        out = r.stdout.lower()
+        self.assertTrue("high model rejected" in out or "wrong model" in out, r.stdout)
+        self.assertIn("claude-sonnet-4-5", r.stdout)
+        self.assertIn("claude-haiku-4-5", r.stdout)
+        self.assertFalse((self.bundle / "okf/temporal/tailer.json").exists())
+
+    def test_setup_rejects_sol_and_terra_without_writing(self):
+        env = dict(self.env)
+        env["PATH"] = str(self._fake_cli("codex")) + os.pathsep + env.get("PATH", "")
+        for high in ("gpt-5.6-sol", "gpt-5.6-terra"):
+            r = run_tail(
+                [
+                    "setup",
+                    "--edition",
+                    "a",
+                    "--host",
+                    "codex",
+                    "--model",
+                    high,
+                    "--jsonl",
+                    str(FIXTURE),
+                    "--role",
+                    "software_engineer",
+                    "--agent",
+                    "local",
+                ],
+                env=env,
+                bundle=str(self.bundle),
+            )
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("high model rejected", r.stdout.lower())
+            self.assertFalse((self.bundle / "okf/temporal/tailer.json").exists())
+
     def test_setup_edition_a_succeeds_with_pinned_model(self):
         env = dict(self.env)
         env["PATH"] = str(self._fake_cli()) + os.pathsep + env.get("PATH", "")
@@ -699,14 +765,30 @@ class TestOptInGate(unittest.TestCase):
 
     def test_check_and_status_report_opt_in(self):
         skipped = run_tail(
-            ["check", "--jsonl", str(FIXTURE), "--author", "local/tailer"],
+            [
+                "check",
+                "--jsonl",
+                str(FIXTURE),
+                "--author",
+                "local/tailer",
+                "--project",
+                str(self.bare),
+                "--role",
+                "software_engineer",
+                "--agent",
+                "local",
+            ],
             env=self.env,
             bundle=str(self.bundle),
         )
-        self.assertEqual(skipped.returncode, 0, skipped.stdout + skipped.stderr)
+        self.assertEqual(skipped.returncode, 1, skipped.stdout + skipped.stderr)
         chk = json.loads(skipped.stdout)
         self.assertFalse(chk["opted_in"])
         self.assertEqual(chk["skipped"], "not_opted_in")
+        self.assertTrue(chk.get("okf_history_candidates"), chk)
+        self.assertIn(str((self.bare / ".okf-history").resolve()), chk["okf_history_candidates"])
+        self.assertEqual(Path(chk["jsonl"]).resolve(), FIXTURE.resolve())
+        self.assertEqual(chk["session_id"], "software_engineer__local__001")
         project = write_history_marker(Path(self.tmp.name))
         ok = run_tail(
             ["check", "--jsonl", str(FIXTURE), "--author", "local/tailer", "--project", str(project)],
@@ -716,12 +798,46 @@ class TestOptInGate(unittest.TestCase):
         self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
         self.assertTrue(json.loads(ok.stdout)["opted_in"])
         st = run_tail(
-            ["status", "--jsonl", str(FIXTURE), "--project", str(project), "--role", "software_engineer", "--agent", "local"],
+            ["status", "--jsonl", str(FIXTURE), "--project", str(self.bare), "--role", "software_engineer", "--agent", "local"],
             env=self.env,
             bundle=str(self.bundle),
         )
         self.assertEqual(st.returncode, 0, st.stdout + st.stderr)
-        self.assertTrue(json.loads(st.stdout)["opted_in"])
+        status = json.loads(st.stdout)
+        self.assertFalse(status["opted_in"])
+        self.assertEqual(status["skipped"], "not_opted_in")
+        self.assertTrue(status.get("okf_history_candidates"), status)
+        self.assertEqual(status["session_id"], "software_engineer__local__001")
+        opted = run_tail(
+            ["status", "--jsonl", str(FIXTURE), "--project", str(project), "--role", "software_engineer", "--agent", "local"],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(opted.returncode, 0, opted.stdout + opted.stderr)
+        self.assertTrue(json.loads(opted.stdout)["opted_in"])
+
+
+class TestSmoke(unittest.TestCase):
+    def test_ots_smoke_uses_fixture_and_stub(self):
+        env = os.environ.copy()
+        env.pop("SECOND_BRAIN_ROOT", None)
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("OPENAI_API_KEY", None)
+        env["SECOND_BRAIN_IDENTITY"] = "local/tailer"
+        r = subprocess.run(
+            [sys.executable, str(OTS), "smoke"],
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        data = json.loads(r.stdout)
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["smoke"], "passed")
+        self.assertEqual(data["session"], "software_engineer__atlas__001")
+        self.assertIn("check_without_opt_in", data["steps"])
+        self.assertIn("summarize", data["steps"])
+        self.assertIn("once_rollover", data["steps"])
 
 
 if __name__ == "__main__":

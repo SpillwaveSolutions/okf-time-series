@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.3 — 2026-09-12
+
+Dogfood gate only. No pointer batch, no Deep Agents, no Langfuse, no `worked_during`, no `.telemetry.md` revive.
+
+- **Installed pin.** Marketplace 0.4.13 already pins OTS **0.3.2** / pointers 0.2.0. Catalog string ≠ git tag. After install, open the installed `plugin.json` and confirm the version field is **0.3.2** (this pack is **0.3.3** on top of that pin). **0.3.1** is the killed emit-schema write path — do not dogfood it.
+- Fiction sample matches Phase-1: deleted `.telemetry.md`; hour 15 is the same slug `software_engineer__atlas__001` with a second segment (hub stays in hour 14). Sample must not teach `__002` for hour rollover. Pattern is `.source.jsonl` + hub + summary/saliency.
+- `status` and `check` print the absolute `.okf-history` candidates walked plus `jsonl` / `session_id` when `skipped: not_opted_in`. `check` exits 1 if not opted in.
+- `ots smoke` (also `ots-tail smoke`): `check && once && tick-hour && summarize --period … --stub && check`. Without `.okf-history` → exit 1 with those paths. With opt-in: snapshot hash unchanged after summarize; hub slug unchanged across a fake hour rollover. Fixtures + `--stub`; no API key.
+- Setup fail-closed on Sonnet / Sol / Terra / any non-pin model. Never write the session default. Edition A pins `claude-haiku-4-5` (Claude), `gpt-5.6-luna` (Codex), `grok-4-fast` (Grok).
+- Idle flush default stays **300** seconds. Dogfood may pass `--idle 60` if follow stalls; do not change the default unless asked.
+
 ## 0.3.2 — 2026-09-12
 
 - Snapshot-first capture: `sessions/<slug>.source.jsonl` is the immutable vendor JSONL copy. No stored `TELEMETRY_EMIT` write schema.

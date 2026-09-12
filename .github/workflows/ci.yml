@@ -19,3 +19,5 @@ jobs:
         run: python3 -m py_compile scripts/*.py
       - name: Validate sample-knowledge
         run: python3 scripts/ots_common.py validate --bundle sample-knowledge
+      - name: Smoke
+        run: python3 scripts/ots smoke

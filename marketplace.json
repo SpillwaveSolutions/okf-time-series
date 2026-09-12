@@ -1,13 +1,13 @@
 {
   "name": "okf-time-series-marketplace",
   "description": "Optional native marketplace metadata. Grok Build already loads Claude plugins with zero config.",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "plugins": [
     {
       "name": "okf-time-series",
       "source": ".",
       "description": "Chronological spine for agent memory: Session → Hour → Day → Week → Month → Year. Git-native OKF plugin.",
-      "version": "0.3.2",
+      "version": "0.3.3",
       "compatibility": {
         "claude_plugin": true,
         "zero_config": true

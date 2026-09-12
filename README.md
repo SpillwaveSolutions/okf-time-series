@@ -6,6 +6,8 @@ Chronological spine for agent memory. Session → Hour → Day → Week → Mont
 
 Companion: [okf-pointers](https://github.com/SpillwaveSolutions/okf-pointers) (#73) · [okf-remote](https://github.com/SpillwaveSolutions/okf-remote) (#74)
 
+**Installed version.** Marketplace catalog strings are not git tags. Marketplace 0.4.13 already pins OTS **0.3.2** / pointers 0.2.0. After install, open the installed `plugin.json` and confirm the version field is **0.3.2** (this pack is **0.3.3**). **0.3.1** is the killed emit-schema write path — do not dogfood it.
+
 ## Nouns this plugin may write
 
 `temporal.year` · `temporal.month` · `temporal.week` · `temporal.day` · `temporal.hour` · `temporal.session` · `temporal.telemetry` · `temporal.summary` · `temporal.saliency`
@@ -43,7 +45,7 @@ python3 scripts/ots_tail_jsonl.py once \
   --bundle "$SECOND_BRAIN_ROOT"
 ```
 
-`ots-tail` also has `start` / `stop` / `status` / `check` / `setup` (`setup` writes `okf/temporal/tailer.json`; never a private remote). Pipeline: tail → `tick-hour` → `summarize --period` → `rollup` → overnight pointers (separate). Summarize Edition A (host CLI + pinned cheapest model) or Edition B (API key). Inspect with `ots sessions list` / `show`. Cron helper: `ots print-cron`. Phase-1 snapshot rule: [docs/PRD-TELEMETRY-PHASE1.md](docs/PRD-TELEMETRY-PHASE1.md). Emit table is a **read-time filter**, not stored: [docs/TELEMETRY_EMIT.md](docs/TELEMETRY_EMIT.md).
+`ots-tail` also has `start` / `stop` / `status` / `check` / `setup` / `smoke` (`setup` writes `okf/temporal/tailer.json`; never a private remote). `status` and `check` print the `.okf-history` paths walked when `skipped: not_opted_in`. `check` exits 1 if not opted in. One-command gate: `python3 scripts/ots smoke` (fixtures + `--stub`; no API key). Pipeline: tail → `tick-hour` → `summarize --period` → `rollup` → overnight pointers (separate; not in this pack). Summarize Edition A (host CLI + pinned cheapest model: `claude-haiku-4-5` / `gpt-5.6-luna` / `grok-4-fast`) or Edition B (API key). Setup fails closed on Sonnet / Sol / Terra / any non-pin. Inspect with `ots sessions list` / `show`. Cron helper: `ots print-cron`. Idle flush default is 300s (dogfood may use `--idle 60` if follow stalls). Phase-1 snapshot rule: [docs/PRD-TELEMETRY-PHASE1.md](docs/PRD-TELEMETRY-PHASE1.md). Emit table is a **read-time filter**, not stored: [docs/TELEMETRY_EMIT.md](docs/TELEMETRY_EMIT.md).
 
 Milestone segments are hour-aligned. Telemetry retention defaults to 90 days. The watchdog is global, default one hour.
 

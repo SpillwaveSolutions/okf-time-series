@@ -5,7 +5,7 @@ Copies the vendor transcript byte-for-byte into
 `sessions/<slug>.source.jsonl`. That file is the immutable capture.
 No vendor-neutral emit JSONL is stored. No LLM. No host hooks.
 
-Commands: once | follow | start | stop | status | check | setup | opt-in | opt-out
+Commands: once | follow | start | stop | status | check | setup | opt-in | opt-out | smoke
 
 Capture is opt-in. Install is not capture. No `.okf-history` and no
 session opt-in → skip entirely (no snapshot, hub, or cursor). A bundle
@@ -183,6 +183,30 @@ def _as_path_list(raw) -> list[Path]:
     return out
 
 
+def history_candidates(*starts: Path | None) -> list[str]:
+    """Absolute `.okf-history` paths considered while walking up each start."""
+    out: list[str] = []
+    seen: set[str] = set()
+    for start in starts:
+        if start is None:
+            continue
+        try:
+            cur = Path(start).expanduser().resolve()
+        except OSError:
+            continue
+        if cur.is_file():
+            cur = cur.parent
+        for _ in range(48):
+            marker = str(cur / HISTORY_MARKER)
+            if marker not in seen:
+                seen.add(marker)
+                out.append(marker)
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+    return out
+
+
 def find_history_root(start: Path | None) -> Path | None:
     """Walk up for `.okf-history`. Do not treat okf/ or a bundle as a marker."""
     if start is None:
@@ -237,7 +261,11 @@ def decide_opt_in(
         for listed in sessions:
             try:
                 if listed.resolve() == j:
-                    return {"opted_in": True, "reason": "session", "project": str(project) if project else "", "marker": ""}
+                    return _attach_opt_in_probe(
+                        {"opted_in": True, "reason": "session", "project": str(project) if project else "", "marker": ""},
+                        jsonl,
+                        project,
+                    )
             except OSError:
                 continue
     proj = project
@@ -246,19 +274,45 @@ def decide_opt_in(
     if proj is not None:
         marker_root = find_history_root(proj)
         if marker_root:
-            return {
-                "opted_in": True,
-                "reason": "project",
-                "project": str(marker_root),
-                "marker": str(marker_root / HISTORY_MARKER),
-            }
+            return _attach_opt_in_probe(
+                {
+                    "opted_in": True,
+                    "reason": "project",
+                    "project": str(marker_root),
+                    "marker": str(marker_root / HISTORY_MARKER),
+                },
+                jsonl,
+                marker_root,
+            )
         for listed in dirs:
             try:
                 if _path_under(proj, listed) or _path_under(listed, proj):
-                    return {"opted_in": True, "reason": "project", "project": str(proj.resolve()), "marker": ""}
+                    hit = {
+                        "opted_in": True,
+                        "reason": "project",
+                        "project": str(proj.resolve()),
+                        "marker": "",
+                    }
+                    return _attach_opt_in_probe(hit, jsonl, proj)
             except OSError:
                 continue
-    return {"opted_in": False, "reason": "none", "project": str(proj) if proj else "", "marker": "", "hint": OPT_IN_HINT}
+    return _attach_opt_in_probe(
+        {"opted_in": False, "reason": "none", "project": str(proj) if proj else "", "marker": "", "hint": OPT_IN_HINT},
+        jsonl,
+        proj,
+    )
+
+
+def _attach_opt_in_probe(decision: dict, jsonl: Path | None, project: Path | None) -> dict:
+    """Always record the paths walked so first-run 'why no capture' is visible."""
+    cwd: Path | None = None
+    try:
+        cwd = Path.cwd()
+    except OSError:
+        cwd = None
+    decision["okf_history_candidates"] = history_candidates(project, jsonl, cwd)
+    decision["jsonl"] = str(jsonl.resolve()) if jsonl is not None else ""
+    return decision
 
 
 def skip_not_opted_in(decision: dict, **extra) -> int:
@@ -268,10 +322,35 @@ def skip_not_opted_in(decision: dict, **extra) -> int:
         "opted_in": False,
         "opt_in_reason": decision.get("reason") or "none",
         "hint": decision.get("hint") or OPT_IN_HINT,
+        "okf_history_candidates": decision.get("okf_history_candidates") or [],
+        "jsonl": extra.get("jsonl") or decision.get("jsonl") or "",
         **extra,
     }
     print(json.dumps(payload))
     return 0
+
+
+def session_id_from_args(args, cursor: Cursor | None = None) -> str:
+    if cursor and cursor.session_id:
+        return cursor.session_id
+    role = (getattr(args, "role", "") or "").strip()
+    agent = (getattr(args, "agent", "") or "").strip()
+    if role and agent:
+        return session_slug(role, agent, int(getattr(args, "n", 1) or 1))
+    return ""
+
+
+def not_opted_in_fields(decision: dict, args, jsonl: Path | None, cursor: Cursor | None = None) -> dict:
+    return {
+        "opted_in": bool(decision.get("opted_in")),
+        "opt_in_reason": decision.get("reason") or "none",
+        "skipped": None if decision.get("opted_in") else "not_opted_in",
+        "hint": None if decision.get("opted_in") else (decision.get("hint") or OPT_IN_HINT),
+        "okf_history_candidates": decision.get("okf_history_candidates") or [],
+        "jsonl": str(jsonl.resolve()) if jsonl is not None else (decision.get("jsonl") or ""),
+        "session_id": session_id_from_args(args, cursor),
+        "marker": decision.get("marker") or "",
+    }
 
 
 def gate_or_skip(args, jsonl: Path | None, cfg: dict | None = None) -> dict | None:
@@ -769,21 +848,26 @@ def cmd_status(args) -> int:
     if jsonl_path and not jsonl_path.exists():
         jsonl_path = None
     decision = decide_opt_in(jsonl_path, resolve_project(getattr(args, "project", "") or "", jsonl_path), cfg)
+    probe = not_opted_in_fields(decision, args, jsonl_path, cursor)
     print(
         json.dumps(
             {
                 "ok": True,
                 "running": pid is not None,
                 "pid": pid,
-                "jsonl": jsonl_raw,
+                "jsonl": probe["jsonl"] or jsonl_raw,
                 "source": source,
-                "session": slug or "",
+                "session": slug or probe["session_id"],
+                "session_id": probe["session_id"] or slug or "",
                 "session_path": session or "",
                 "cursor": cursor.to_json(),
                 "cursor_path": str(cursor_path),
-                "opted_in": bool(decision.get("opted_in")),
-                "opt_in_reason": decision.get("reason") or "none",
-                "skipped": None if decision.get("opted_in") else "not_opted_in",
+                "opted_in": probe["opted_in"],
+                "opt_in_reason": probe["opt_in_reason"],
+                "skipped": probe["skipped"],
+                "okf_history_candidates": probe["okf_history_candidates"],
+                "marker": probe["marker"],
+                "hint": probe["hint"],
             }
         )
     )
@@ -809,19 +893,23 @@ def cmd_check(args) -> int:
             return fail("cursor stale", reason=reason, cursor=cursor.to_json())
     cfg = load_tailer_config(bundle)
     decision = decide_opt_in(jsonl, resolve_project(getattr(args, "project", "") or "", jsonl), cfg)
-    print(
-        json.dumps(
-            {
-                "ok": True,
-                "source": str(jsonl),
-                "cursor": cursor.to_json(),
-                "opted_in": bool(decision.get("opted_in")),
-                "opt_in_reason": decision.get("reason") or "none",
-                "skipped": None if decision.get("opted_in") else "not_opted_in",
-                "hint": None if decision.get("opted_in") else OPT_IN_HINT,
-            }
-        )
-    )
+    probe = not_opted_in_fields(decision, args, jsonl, cursor)
+    payload = {
+        "ok": bool(decision.get("opted_in")),
+        "source": str(jsonl),
+        "cursor": cursor.to_json(),
+        "opted_in": probe["opted_in"],
+        "opt_in_reason": probe["opt_in_reason"],
+        "skipped": probe["skipped"],
+        "hint": probe["hint"],
+        "okf_history_candidates": probe["okf_history_candidates"],
+        "jsonl": probe["jsonl"] or str(jsonl),
+        "session_id": probe["session_id"],
+        "marker": probe["marker"],
+    }
+    print(json.dumps(payload))
+    if not decision.get("opted_in"):
+        return 1
     return 0
 
 
@@ -844,6 +932,14 @@ def cmd_setup(args) -> int:
     identity = (getattr(args, "identity", "") or getattr(args, "author", "") or "local/tailer").strip()
     edition = (getattr(args, "edition", "") or "").strip().lower()
     model = (getattr(args, "model", "") or "").strip()
+    if model:
+        try:
+            rejected = editions.reject_non_pin_model(host, model)
+        except ValueError as exc:
+            return fail(str(exc), got=model)
+        if rejected:
+            print(json.dumps(rejected))
+            return 1
     data = {
         "v": 1,
         "identity": identity,
@@ -877,8 +973,9 @@ def cmd_setup(args) -> int:
             print(json.dumps(check))
             return 1
         data.update(extra)
-        if model:
-            data["model"] = extra["model"]
+        data["model"] = extra["model"]
+        if data["model"] != editions.pin_for(host)["model"]:
+            return fail("wrong model", wanted=editions.pin_for(host)["model"], got=data["model"])
     existing = load_tailer_config(bundle)
     for key in ("opt_in_sessions", "opt_in_dirs"):
         if existing.get(key) and key not in data:
@@ -990,6 +1087,184 @@ def cmd_opt_out(args) -> int:
     return 0
 
 
+def _json_last(raw: str) -> dict:
+    text = (raw or "").strip()
+    if not text:
+        return {}
+    try:
+        return json.loads(text.splitlines()[-1])
+    except json.JSONDecodeError:
+        return {"raw": text[-800:]}
+
+
+def cmd_smoke(args) -> int:
+    """One-command dogfood gate: check && once && tick-hour && summarize --stub && check.
+
+    Fixtures only. No API key. Asserts:
+    - without `.okf-history` → check exits 1 and prints walked paths
+    - with opt-in: snapshot hash unchanged after summarize
+    - hub slug unchanged across a fake hour rollover
+    """
+    import hashlib
+    import tempfile
+
+    raw_jsonl = str(getattr(args, "jsonl", "") or "").strip()
+    src = Path(raw_jsonl) if raw_jsonl else SCRIPT_DIR.parent / "tests" / "fixtures" / "host-session.jsonl"
+    if not src.exists() or not src.is_file():
+        return fail("missing fixture", path=str(src), hint="pass --jsonl or keep tests/fixtures/host-session.jsonl")
+    author = (getattr(args, "author", "") or os.environ.get("SECOND_BRAIN_IDENTITY") or "local/tailer").strip()
+    steps: list[dict] = []
+    tailer = Path(__file__).resolve()
+    common_py = SCRIPT_DIR / "ots_common.py"
+
+    def run_py(script: Path, argv: list[str], env: dict) -> subprocess.CompletedProcess:
+        return subprocess.run([sys.executable, str(script), *argv], capture_output=True, text=True, env=env)
+
+    with tempfile.TemporaryDirectory(prefix="ots-smoke-") as tmp:
+        tmp_p = Path(tmp)
+        env = os.environ.copy()
+        env["SECOND_BRAIN_IDENTITY"] = author
+        env.pop("SECOND_BRAIN_ROOT", None)
+        env.pop("OKF_PROJECT_ROOT", None)
+
+        bare_bundle = tmp_p / "bare-bundle"
+        bare_bundle.mkdir()
+        bare_proj = tmp_p / "bare-project"
+        bare_proj.mkdir()
+        skipped = run_py(
+            tailer,
+            [
+                "check",
+                "--jsonl",
+                str(src),
+                "--bundle",
+                str(bare_bundle),
+                "--author",
+                author,
+                "--project",
+                str(bare_proj),
+                "--role",
+                "software_engineer",
+                "--agent",
+                "atlas",
+            ],
+            env,
+        )
+        skip_payload = _json_last(skipped.stdout)
+        steps.append({"step": "check_without_opt_in", "returncode": skipped.returncode, "out": skip_payload})
+        if skipped.returncode != 1 or skip_payload.get("skipped") != "not_opted_in":
+            return fail("smoke: expected check exit 1 without .okf-history", steps=steps)
+        candidates = skip_payload.get("okf_history_candidates") or []
+        if not candidates:
+            return fail("smoke: missing okf_history_candidates on not_opted_in", steps=steps)
+        expected_marker = str((bare_proj / HISTORY_MARKER).resolve())
+        if expected_marker not in candidates:
+            return fail("smoke: walked paths omit project .okf-history", expected=expected_marker, steps=steps)
+        if not skip_payload.get("jsonl") and not skip_payload.get("session_id"):
+            return fail("smoke: not_opted_in omitted jsonl/session_id", steps=steps)
+
+        bundle = tmp_p / "bundle"
+        bundle.mkdir()
+        project = tmp_p / "project"
+        project.mkdir()
+        (project / HISTORY_MARKER).write_text("", encoding="utf-8")
+        host = tmp_p / "host.jsonl"
+        host.write_bytes(src.read_bytes())
+        common = [
+            "--jsonl",
+            str(host),
+            "--bundle",
+            str(bundle),
+            "--author",
+            author,
+            "--project",
+            str(project),
+            "--role",
+            "software_engineer",
+            "--agent",
+            "atlas",
+            "--n",
+            "1",
+            "--host",
+            "claude-code",
+        ]
+        for name in ("check", "once"):
+            r = run_py(tailer, [name, *common], env)
+            steps.append({"step": name, "returncode": r.returncode, "out": _json_last(r.stdout)})
+            if r.returncode != 0:
+                return fail(f"smoke: {name} failed", steps=steps)
+
+        sources = list(bundle.rglob("software_engineer__atlas__001.source.jsonl"))
+        if not sources:
+            return fail("smoke: missing snapshot", steps=steps)
+        digest = hashlib.sha256(sources[0].read_bytes()).hexdigest()
+
+        tick = run_py(
+            common_py,
+            ["tick-hour", "--period", "2026-08-21T14", "--bundle", str(bundle), "--author", author, "--ensure-parents"],
+            env,
+        )
+        steps.append({"step": "tick-hour", "returncode": tick.returncode, "out": _json_last(tick.stdout)})
+        if tick.returncode != 0:
+            return fail("smoke: tick-hour failed", steps=steps)
+
+        summ = run_py(
+            common_py,
+            ["summarize", "--period", "2026-08-21T14", "--bundle", str(bundle), "--author", author, "--stub"],
+            env,
+        )
+        steps.append({"step": "summarize", "returncode": summ.returncode, "out": _json_last(summ.stdout)})
+        if summ.returncode != 0:
+            return fail("smoke: summarize failed", steps=steps)
+        after = hashlib.sha256(sources[0].read_bytes()).hexdigest()
+        if after != digest:
+            return fail("smoke: snapshot hash changed after summarize", before=digest, after=after, steps=steps)
+
+        chk2 = run_py(tailer, ["check", *common], env)
+        steps.append({"step": "check_after", "returncode": chk2.returncode, "out": _json_last(chk2.stdout)})
+        if chk2.returncode != 0:
+            return fail("smoke: check after pipeline failed", steps=steps)
+
+        with host.open("a", encoding="utf-8") as fh:
+            fh.write(
+                '{"type":"user","timestamp":"2026-08-21T15:01:00.000Z","sessionId":"host-sess-1",'
+                '"message":{"role":"user","content":"continue after the hour"}}\n'
+            )
+            fh.write(
+                '{"type":"assistant","timestamp":"2026-08-21T15:01:20.000Z","sessionId":"host-sess-1",'
+                '"message":{"role":"assistant","content":[{"type":"text","text":"same Atlas slug on the next hour"}]}}\n'
+            )
+        once2 = run_py(tailer, ["once", *common], env)
+        steps.append({"step": "once_rollover", "returncode": once2.returncode, "out": _json_last(once2.stdout)})
+        if once2.returncode != 0:
+            return fail("smoke: once after rollover failed", steps=steps)
+        hubs = [p for p in bundle.rglob("software_engineer__atlas__001.md") if p.parent.name == "sessions"]
+        minted = list(bundle.rglob("software_engineer__atlas__002.md"))
+        if len(hubs) != 1 or minted:
+            return fail(
+                "smoke: hub slug changed on hour rollover",
+                hubs=[str(h) for h in hubs],
+                minted=[str(m) for m in minted],
+                steps=steps,
+            )
+        hub_text = hubs[0].read_text(encoding="utf-8")
+        if "2026-08-21T15" not in hub_text:
+            return fail("smoke: rollover did not open the next-hour segment on the same slug", steps=steps)
+
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "smoke": "passed",
+                    "snapshot_sha256": digest,
+                    "session": "software_engineer__atlas__001",
+                    "steps": [s["step"] for s in steps],
+                }
+            )
+        )
+        return 0
+
+
 def add_common_flags(p: argparse.ArgumentParser, *, require_agent: bool = False) -> None:
     p.add_argument("--jsonl", default="", help="host session JSONL (read-only)")
     p.add_argument("--bundle", default="", help="OKF bundle; default SECOND_BRAIN_ROOT")
@@ -1017,7 +1292,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--follow", action="store_true", help="compat: long-running foreground")
     add_common_flags(p)
     sub = p.add_subparsers(dest="cmd")
-    for name in ("once", "follow", "start", "stop", "status", "check", "setup", "opt-in", "opt-out"):
+    for name in ("once", "follow", "start", "stop", "status", "check", "setup", "opt-in", "opt-out", "smoke"):
         sp = sub.add_parser(name)
         add_common_flags(sp)
     return p
@@ -1034,7 +1309,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.follow:
             cmd = "follow"
         else:
-            return fail("missing command", hint="once|follow|start|stop|status|check|setup|opt-in|opt-out")
+            return fail("missing command", hint="once|follow|start|stop|status|check|setup|opt-in|opt-out|smoke")
     handlers = {
         "once": cmd_once,
         "follow": cmd_follow,
@@ -1045,6 +1320,7 @@ def main(argv: list[str] | None = None) -> int:
         "setup": cmd_setup,
         "opt-in": cmd_opt_in,
         "opt-out": cmd_opt_out,
+        "smoke": cmd_smoke,
     }
     try:
         return handlers[cmd](args)
