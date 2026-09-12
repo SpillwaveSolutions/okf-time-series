@@ -1108,8 +1108,8 @@ def cmd_smoke(args) -> int:
     import hashlib
     import tempfile
 
-    fixture = Path(getattr(args, "jsonl", "") or "").strip()
-    src = Path(fixture) if fixture else SCRIPT_DIR.parent / "tests" / "fixtures" / "host-session.jsonl"
+    raw_jsonl = str(getattr(args, "jsonl", "") or "").strip()
+    src = Path(raw_jsonl) if raw_jsonl else SCRIPT_DIR.parent / "tests" / "fixtures" / "host-session.jsonl"
     if not src.exists() or not src.is_file():
         return fail("missing fixture", path=str(src), hint="pass --jsonl or keep tests/fixtures/host-session.jsonl")
     author = (getattr(args, "author", "") or os.environ.get("SECOND_BRAIN_IDENTITY") or "local/tailer").strip()
