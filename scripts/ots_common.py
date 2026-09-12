@@ -1158,6 +1158,17 @@ def cmd_close_segment(args) -> int:
 
 
 def _telemetry_cutoff_time(path: Path) -> datetime:
+    if path.name.endswith(".source.jsonl"):
+        stem = path.name[: -len(".source.jsonl")]
+        session = path.parent / f"{stem}.md"
+        if session.exists():
+            sm, _ = parse_frontmatter(session.read_text(encoding="utf-8"))
+            if sm.get("ended_at"):
+                try:
+                    return parse_iso(str(sm["ended_at"]))
+                except ValueError:
+                    pass
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
     meta, _ = parse_frontmatter(path.read_text(encoding="utf-8"))
     for key in ("ended_at", "timestamp"):
         if meta.get(key):
@@ -1185,8 +1196,11 @@ def cmd_prune_telemetry(args) -> int:
     removed: list[str] = []
     root = bundle / "okf" / "temporal"
     if root.exists():
-        for p in list(root.rglob("*.md")):
-            if not (p.name.endswith(".telemetry.md") or ".telemetry_" in p.name):
+        candidates = list(root.rglob("*.md")) + list(root.rglob("*.source.jsonl"))
+        for p in candidates:
+            if p.name.endswith(".source.jsonl"):
+                pass
+            elif not (p.name.endswith(".telemetry.md") or ".telemetry_" in p.name):
                 continue
             age = _telemetry_cutoff_time(p)
             if age >= cutoff:
@@ -1222,6 +1236,134 @@ def cmd_prune_telemetry(args) -> int:
                 "removed": removed,
                 "committed": committed,
                 "dry_run": bool(args.dry_run),
+            }
+        )
+    )
+    return 0
+
+
+def _stub_summarize(payload: dict) -> dict:
+    """Deterministic fallback. No API key. Tests mock --model-cmd / OKF_SUMMARIZE_CMD."""
+    turns = payload.get("turns") or []
+    users = [t.get("text", "") for t in turns if t.get("role") == "user" and t.get("text")]
+    assistants = [t.get("text", "") for t in turns if t.get("role") == "assistant" and t.get("text")]
+    summary_bits = users + assistants
+    summary = " ".join(summary_bits).strip() or "(proposed)"
+    if len(summary) > 800:
+        summary = summary[:797] + "..."
+    saliency = "\n".join(f"- {u}" for u in users) or "- (proposed)"
+    return {"summary": summary, "saliency": saliency}
+
+
+def _invoke_summarizer(payload: dict, model_cmd: str | None) -> dict:
+    cmd = (model_cmd or os.environ.get("OKF_SUMMARIZE_CMD") or "").strip()
+    if not cmd:
+        return _stub_summarize(payload)
+    proc = subprocess.run(
+        cmd,
+        shell=True,
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+    )
+    raw = (proc.stdout or "").strip()
+    if proc.returncode != 0:
+        return _stub_summarize(payload)
+    try:
+        data = json.loads(raw.splitlines()[-1] if raw else "{}")
+    except json.JSONDecodeError:
+        return _stub_summarize(payload)
+    if not isinstance(data, dict) or not data.get("summary"):
+        return _stub_summarize(payload)
+    data.setdefault("saliency", "- (proposed)")
+    return data
+
+
+def cmd_summarize_hour(args) -> int:
+    """Read `.source.jsonl`, apply the host-switch filter, write summary/saliency.
+
+    Never touches the snapshot. Haiku (or a stub / --model-cmd) runs here, not
+    in the tailer. Pointers stay out of scope.
+    """
+    author = resolve_author(args.author)
+    bundle = resolve_bundle(args.bundle)
+    period = args.period
+    if not PERIOD_HOUR.match(period):
+        print(json.dumps({"error": f"invalid hour period: {period}"}))
+        return 1
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import ots_filter as flt  # noqa: WPS433
+
+    host = args.host or "claude-code"
+    actor = (os.environ.get("SECOND_BRAIN_IDENTITY") or author).strip()
+    hits = segments_for_hour(bundle, period)
+    updated: list[str] = []
+    skipped: list[str] = []
+    for session_path, meta, seg in hits:
+        slug = str(meta.get("id") or session_path.stem)
+        source = session_path.parent / f"{slug}.source.jsonl"
+        if not source.exists():
+            skipped.append(slug)
+            continue
+        before = source.read_bytes()
+        rows = flt.filter_source_jsonl(
+            source,
+            host=host,
+            session_id=slug,
+            actor=actor,
+            period=period,
+        )
+        payload = {
+            "period": period,
+            "session": slug,
+            "host": host,
+            "turns": rows,
+        }
+        prose = _invoke_summarizer(payload, args.model_cmd)
+        idx = seg_index(seg) or 1
+        summary_name = seg.get("summary") or artifact_name(slug, "summary", idx)
+        saliency_name = seg.get("saliency") or artifact_name(slug, "saliency", idx)
+        for kind, name, body in (
+            ("summary", summary_name, prose.get("summary") or "(proposed)"),
+            ("saliency", saliency_name, prose.get("saliency") or "- (proposed)"),
+        ):
+            dest = session_path.parent / name
+            write_md(
+                dest,
+                {
+                    "type": f"temporal.{kind}",
+                    "title": f"{slug} {kind}",
+                    "session": session_path.name,
+                    "timestamp": now_iso(),
+                    "author": author,
+                },
+                body if str(body).endswith("\n") else str(body) + "\n",
+            )
+        smeta, sbody = parse_frontmatter(session_path.read_text(encoding="utf-8"))
+        segs = [dict(s) if isinstance(s, dict) else s for s in (smeta.get("segments") or [])]
+        for item in segs:
+            if isinstance(item, dict) and seg_hour(item) == period and seg_status(item) == "closed":
+                item["summary"] = summary_name
+                item["saliency"] = saliency_name
+        smeta["segments"] = segs
+        smeta["author"] = author
+        smeta["timestamp"] = now_iso()
+        write_md(session_path, smeta, sbody)
+        after = source.read_bytes()
+        if after != before:
+            print(json.dumps({"error": "source snapshot mutated during summarize", "path": str(source)}))
+            return 1
+        updated.append(slug)
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "period": period,
+                "updated": updated,
+                "skipped_missing_source": skipped,
+                "source_untouched": True,
             }
         )
     )
@@ -1347,6 +1489,18 @@ def main() -> int:
     th.add_argument("--author", default="")
     th.add_argument("--ensure-parents", dest="ensure_parents", action="store_true", default=False)
 
+    sh = sub.add_parser("summarize-hour")
+    sh.add_argument("--bundle", default="")
+    sh.add_argument("--period", required=True, help="hour period, YYYY-MM-DDTHH")
+    sh.add_argument("--author", default="")
+    sh.add_argument("--host", default="claude-code", help="host-switch filter (read-time only)")
+    sh.add_argument(
+        "--model-cmd",
+        dest="model_cmd",
+        default="",
+        help="optional CLI that reads filter-view JSON on stdin and writes {summary,saliency}. Tests stub this. No API key required.",
+    )
+
     cs = sub.add_parser("close-segment")
     cs.add_argument("--bundle", default="")
     cs.add_argument("--id", required=True)
@@ -1378,6 +1532,7 @@ def main() -> int:
         "rollup": cmd_rollup,
         "validate": cmd_validate,
         "tick-hour": cmd_tick_hour,
+        "summarize-hour": cmd_summarize_hour,
         "close-segment": cmd_close_segment,
         "prune-telemetry": cmd_prune_telemetry,
         "watchdog": cmd_watchdog,

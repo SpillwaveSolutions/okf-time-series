@@ -32,19 +32,18 @@ python3 scripts/ots_common.py tick-hour \
 
 Hour nodes come from the scheduled tick, not from session writes. No segments in the window means no Hour node — the hierarchy stays sparse. The tick skips only an Hour that still contains an **open segment**. Closed segments from a long session finalize on schedule. At most one Hour is un-finalized per running session.
 
-Host transcripts enter through the official tailer (no LLM):
+Host transcripts enter through the official tailer (no LLM). The stored capture is a **byte-for-byte** `sessions/<slug>.source.jsonl` snapshot — not a vendor-neutral emit fence:
 
 ```bash
-python3 scripts/ots_tail_jsonl.py --once \
+python3 scripts/ots_tail_jsonl.py once \
   --jsonl tests/fixtures/host-session.jsonl \
   --host claude-code \
   --role software_engineer --agent atlas --n 1 \
   --author "$SECOND_BRAIN_IDENTITY" \
-  --bundle "$SECOND_BRAIN_ROOT" \
-  --cursor /tmp/ots-bundle/host-session.ots-cursor.json
+  --bundle "$SECOND_BRAIN_ROOT"
 ```
 
-Pipeline: tail → `tick-hour` → `rollup` → Haiku summary (separate) → overnight pointers (separate). Body contract: [schemas/okf-temporal/TELEMETRY_EMIT.md](schemas/okf-temporal/TELEMETRY_EMIT.md).
+`ots-tail` also has `start` / `stop` / `status` / `check` / `setup` (`setup` writes `okf/temporal/tailer.json` in the bundle; never a private remote). Pipeline: tail → `tick-hour` → `summarize-hour` → `rollup` → overnight pointers (separate). Phase-1 snapshot rule and the three planes: [docs/PRD-TELEMETRY-PHASE1.md](docs/PRD-TELEMETRY-PHASE1.md). The emit table is a **read-time filter**, not stored: [docs/TELEMETRY_EMIT.md](docs/TELEMETRY_EMIT.md).
 
 Milestone segments are hour-aligned. Telemetry retention defaults to 90 days. The watchdog is global, default one hour.
 

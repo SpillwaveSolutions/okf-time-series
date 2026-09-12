@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2 — 2026-09-12
+
+- Snapshot-first capture: `sessions/<slug>.source.jsonl` is the immutable vendor JSONL copy. No stored `TELEMETRY_EMIT` write schema.
+- `ots_tail_jsonl.py` commands: `once` / `follow` / `start` / `stop` / `status` / `check` / `setup`. Cursor is `path`, `pos` or `size`/`mtime`, `session_id`, `updated_at`. Replace snapshot only if size/mtime grew; never shrink. Idle flush default 300s.
+- `write-session --ensure-spine` confirmed for the tailer hub. Same slug across hours; `close-segment` on rollover.
+- `TELEMETRY_EMIT` moved to `docs/TELEMETRY_EMIT.md` as the **read-time** filter for summarization (user prompt + final assistant; skip `tool_result`). Not stored.
+- `summarize-hour` reads the snapshot, applies the filter, writes `.summary.md` / `.saliency.md`, and does not touch `.source.jsonl`. Model call is stubbable (`--model-cmd` / `OKF_SUMMARIZE_CMD`); tests need no API key.
+- Setup writes `okf/temporal/tailer.json` in the bundle. No private remotes. Phase-1 PRD: `docs/PRD-TELEMETRY-PHASE1.md`.
+
 ## 0.3.1 — 2026-09-12
 
 - Phase-1 telemetry emit body contract: `schemas/okf-temporal/TELEMETRY_EMIT.md` (`v`, `ts`, `host`, `session_id`, `actor`, `turn`, `role`, `text`). Frontmatter unchanged.
