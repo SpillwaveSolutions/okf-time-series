@@ -17,7 +17,7 @@ Commands: `once` · `follow` · `start` · `stop` · `status` · `check` · `set
 - `--follow` / `follow` is long-running. `once` copies if the host grew, then exits.
 - Idle flush default is 300 seconds. Cursor (`path`, `pos` or `size`/`mtime`, `session_id`, `updated_at`) makes restart idempotent.
 - `check` exits 1 on missing source, unset identity, or a stale cursor.
-- `setup` writes `okf/temporal/tailer.json` in the bundle. Never hard-code a private remote.
+- `setup` writes `okf/temporal/tailer.json` in the bundle. `--edition a` verifies the host CLI + pinned cheapest model; `--edition b` verifies the API key env. Never hard-code a private remote. Optional overlay: `~/.okf/ots-tail.json`.
 - Session hub via `write-session --ensure-spine`. Same slug across hours; new segment on hour rollover.
 
 Pipeline: tail → `tick-hour` → `summarize-hour` → `rollup` → overnight pointers (separate).

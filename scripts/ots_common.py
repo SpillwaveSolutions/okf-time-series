@@ -388,9 +388,8 @@ def close_segment_entry(seg: dict, slug: str, session_path: Path, author: str, s
     out.pop("period", None)
     if telemetry:
         out["telemetry"] = telemetry
-    if not out.get("telemetry"):
-        out["telemetry"] = artifact_name(slug, "telemetry", idx)
         write_proposed_artifact(session_path, out["telemetry"], "telemetry", slug, author)
+    # Phase 1: .source.jsonl + hub required; .telemetry.md deferred/omit.
     out["summary"] = summary or out.get("summary") or artifact_name(slug, "summary", idx)
     out["saliency"] = saliency or out.get("saliency") or artifact_name(slug, "saliency", idx)
     write_proposed_artifact(session_path, out["summary"], "summary", slug, author)
@@ -1243,7 +1242,7 @@ def cmd_prune_telemetry(args) -> int:
 
 
 def _stub_summarize(payload: dict) -> dict:
-    """Deterministic fallback. No API key. Tests mock --model-cmd / OKF_SUMMARIZE_CMD."""
+    """Explicit --stub only. Never a silent fallback from Edition A/B."""
     turns = payload.get("turns") or []
     users = [t.get("text", "") for t in turns if t.get("role") == "user" and t.get("text")]
     assistants = [t.get("text", "") for t in turns if t.get("role") == "assistant" and t.get("text")]
@@ -1255,35 +1254,76 @@ def _stub_summarize(payload: dict) -> dict:
     return {"summary": summary, "saliency": saliency}
 
 
-def _invoke_summarizer(payload: dict, model_cmd: str | None) -> dict:
-    cmd = (model_cmd or os.environ.get("OKF_SUMMARIZE_CMD") or "").strip()
-    if not cmd:
+def _load_editions():
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    import ots_editions as editions  # noqa: WPS433
+
+    return editions
+
+
+def _invoke_summarizer(payload: dict, args, bundle: Path) -> dict:
+    """Inline model call. No hidden queue. No silent Edition B fallback."""
+    cmd = (getattr(args, "model_cmd", "") or os.environ.get("OKF_SUMMARIZE_CMD") or "").strip()
+    if cmd:
+        proc = subprocess.run(cmd, shell=True, input=json.dumps(payload), capture_output=True, text=True)
+        if proc.returncode != 0:
+            print(json.dumps({"error": "model-cmd failed", "returncode": proc.returncode, "stderr": (proc.stderr or "")[-400:]}))
+            raise SystemExit(1)
+        try:
+            return _load_editions().parse_model_json(proc.stdout)
+        except ValueError as exc:
+            print(json.dumps({"error": "model-cmd output", "detail": str(exc)}))
+            raise SystemExit(1)
+    if getattr(args, "stub", False):
         return _stub_summarize(payload)
-    proc = subprocess.run(
-        cmd,
-        shell=True,
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-    )
-    raw = (proc.stdout or "").strip()
-    if proc.returncode != 0:
-        return _stub_summarize(payload)
+    editions = _load_editions()
     try:
-        data = json.loads(raw.splitlines()[-1] if raw else "{}")
-    except json.JSONDecodeError:
-        return _stub_summarize(payload)
-    if not isinstance(data, dict) or not data.get("summary"):
-        return _stub_summarize(payload)
-    data.setdefault("saliency", "- (proposed)")
-    return data
+        cfg = editions.load_config(bundle)
+    except ValueError as exc:
+        print(json.dumps({"error": str(exc)}))
+        raise SystemExit(1)
+    edition = (getattr(args, "edition", "") or cfg.get("edition") or "").strip().lower()
+    host = getattr(args, "host", "") or cfg.get("host") or payload.get("host") or "claude-code"
+    if edition == "a":
+        try:
+            return editions.invoke_edition_a(host, payload)
+        except RuntimeError as exc:
+            print(exc.args[0] if exc.args else str(exc))
+            raise SystemExit(1)
+    if edition == "b":
+        try:
+            return editions.invoke_edition_b(host, payload, cfg=cfg)
+        except RuntimeError as exc:
+            print(exc.args[0] if exc.args else str(exc))
+            raise SystemExit(1)
+    print(
+        json.dumps(
+            {
+                "error": "summarize edition not configured",
+                "hint": "run ots-tail setup --edition a|b, or pass --stub / --model-cmd (tests). No silent fallback.",
+            }
+        )
+    )
+    raise SystemExit(1)
+
+
+def cmd_summarize(args) -> int:
+    """ots summarize --period YYYY-MM-DDTHH. Inline model. --status inspects only."""
+    if getattr(args, "status_only", False):
+        return cmd_summarize_status(args)
+    if not args.period:
+        print(json.dumps({"error": "pass --period YYYY-MM-DDTHH", "hint": "ots summarize --period … or ots summarize --status --period …"}))
+        return 1
+    return cmd_summarize_hour(args)
 
 
 def cmd_summarize_hour(args) -> int:
     """Read `.source.jsonl`, apply the host-switch filter, write summary/saliency.
 
-    Never touches the snapshot. Haiku (or a stub / --model-cmd) runs here, not
-    in the tailer. Pointers stay out of scope.
+    Never touches the snapshot. Edition A/B (or explicit --stub / --model-cmd)
+    run inline. Pointers stay out of scope.
     """
     author = resolve_author(args.author)
     bundle = resolve_bundle(args.bundle)
@@ -1321,7 +1361,7 @@ def cmd_summarize_hour(args) -> int:
             "host": host,
             "turns": rows,
         }
-        prose = _invoke_summarizer(payload, args.model_cmd)
+        prose = _invoke_summarizer(payload, args, bundle)
         idx = seg_index(seg) or 1
         summary_name = seg.get("summary") or artifact_name(slug, "summary", idx)
         saliency_name = seg.get("saliency") or artifact_name(slug, "saliency", idx)
@@ -1367,6 +1407,123 @@ def cmd_summarize_hour(args) -> int:
             }
         )
     )
+    return 0
+
+
+def _artifact_body_excerpt(path: Path, limit: int = 400) -> str:
+    if not path.exists():
+        return ""
+    _meta, body = parse_frontmatter(path.read_text(encoding="utf-8"))
+    return " ".join(body.split())[:limit]
+
+
+def _session_inspect(session_path: Path, slug: str) -> dict:
+    meta, _ = parse_frontmatter(session_path.read_text(encoding="utf-8"))
+    summary = session_path.parent / f"{slug}.summary.md"
+    saliency = session_path.parent / f"{slug}.saliency.md"
+    source = session_path.parent / f"{slug}.source.jsonl"
+    segs = meta.get("segments") or []
+    hours = [seg_hour(s) for s in segs if isinstance(s, dict) and seg_hour(s)]
+    return {
+        "id": slug,
+        "status": meta.get("status", ""),
+        "hours": hours,
+        "source": source.exists(),
+        "summary": summary.exists(),
+        "saliency": saliency.exists(),
+        "summary_excerpt": _artifact_body_excerpt(summary) if summary.exists() else "",
+        "saliency_excerpt": _artifact_body_excerpt(saliency) if saliency.exists() else "",
+        "path": str(session_path),
+    }
+
+
+def cmd_summarize_status(args) -> int:
+    bundle = resolve_bundle(args.bundle)
+    period = args.period
+    if period and not PERIOD_HOUR.match(period):
+        print(json.dumps({"error": f"invalid hour period: {period}"}))
+        return 1
+    rows = []
+    if period:
+        hits = segments_for_hour(bundle, period)
+        seen = set()
+        for session_path, meta, _seg in hits:
+            slug = str(meta.get("id") or session_path.stem)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            rows.append(_session_inspect(session_path, slug))
+    else:
+        for session_path in iter_session_files(bundle) or []:
+            meta, _ = parse_frontmatter(session_path.read_text(encoding="utf-8"))
+            slug = str(meta.get("id") or session_path.stem)
+            rows.append(_session_inspect(session_path, slug))
+    print(json.dumps({"ok": True, "period": period, "sessions": rows}, indent=2))
+    return 0
+
+
+def cmd_sessions(args) -> int:
+    bundle = resolve_bundle(args.bundle)
+    action = args.action
+    if action == "show":
+        slug = (args.id or "").strip()
+        if not slug:
+            print(json.dumps({"error": "pass --id"}))
+            return 1
+        root = bundle / "okf" / "temporal"
+        matches = []
+        if root.exists():
+            matches = [p for p in root.rglob(f"{slug}.md") if p.parent.name == "sessions" and not _is_session_artifact(p.name)]
+        if not matches:
+            print(json.dumps({"error": "session not found", "id": slug}))
+            return 1
+        rec = _session_inspect(matches[0], slug)
+        print(json.dumps({"ok": True, **rec}, indent=2))
+        return 0
+    period = args.period
+    if period and not PERIOD_HOUR.match(period):
+        print(json.dumps({"error": f"invalid hour period: {period}"}))
+        return 1
+    rows = []
+    if period:
+        hits = segments_for_hour(bundle, period)
+        seen = set()
+        for session_path, meta, _seg in hits:
+            slug = str(meta.get("id") or session_path.stem)
+            if slug in seen:
+                continue
+            seen.add(slug)
+            rows.append(_session_inspect(session_path, slug))
+    else:
+        for session_path in iter_session_files(bundle) or []:
+            meta, _ = parse_frontmatter(session_path.read_text(encoding="utf-8"))
+            slug = str(meta.get("id") or session_path.stem)
+            rows.append(_session_inspect(session_path, slug))
+        if args.recent:
+            rows = rows[-args.recent :]
+    print(json.dumps({"ok": True, "period": period or "", "sessions": rows}, indent=2))
+    return 0
+
+
+def cmd_print_cron(args) -> int:
+    """Suggested crontab. Scheduler is the user's cron, not an in-pack queue."""
+    script_dir = Path(__file__).resolve().parent
+    tailer = script_dir / "ots_tail_jsonl.py"
+    common = script_dir / "ots_common.py"
+    bundle = args.bundle or "${SECOND_BRAIN_ROOT}"
+    identity = args.author or "${SECOND_BRAIN_IDENTITY}"
+    py = sys.executable
+    lines = [
+        "# OKF time-series hour-close pipeline (UTC).",
+        "# Scheduler is cron (or any CLI scheduler). Not a hidden queue.",
+        "# Optional long-running capture: ots-tail start. This crontab uses once.",
+        f"5 * * * * {py} {tailer} once --bundle {bundle} --author {identity} && "
+        f"{py} {common} tick-hour --period $(date -u +\\%Y-\\%m-\\%dT\\%H) --bundle {bundle} --author {identity} && "
+        f"{py} {common} summarize --period $(date -u +\\%Y-\\%m-\\%dT\\%H) --bundle {bundle} --author {identity}",
+    ]
+    text = "\n".join(lines) + "\n"
+    print(text, end="")
+    print(json.dumps({"ok": True, "crontab": lines}))
     return 0
 
 
@@ -1416,8 +1573,8 @@ def cmd_watchdog(args) -> int:
     return 0
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(prog="ots_common.py")
+def main(argv: list[str] | None = None) -> int:
+    p = argparse.ArgumentParser(prog="ots")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     i = sub.add_parser("init")
@@ -1489,17 +1646,36 @@ def main() -> int:
     th.add_argument("--author", default="")
     th.add_argument("--ensure-parents", dest="ensure_parents", action="store_true", default=False)
 
+    def _add_summarize_flags(sp):
+        sp.add_argument("--bundle", default="")
+        sp.add_argument("--period", default="", help="hour period, YYYY-MM-DDTHH")
+        sp.add_argument("--author", default="")
+        sp.add_argument("--host", default="", help="host-switch filter (read-time only); default from tailer.json")
+        sp.add_argument("--edition", default="", choices=["a", "b"], help="override tailer.json edition")
+        sp.add_argument("--stub", action="store_true", help="explicit deterministic stub; tests only. Not a silent fallback.")
+        sp.add_argument("--status", dest="status_only", action="store_true", help="print summary/saliency excerpts; do not invoke the model")
+        sp.add_argument(
+            "--model-cmd",
+            dest="model_cmd",
+            default="",
+            help="explicit CLI override (tests). Reads filter-view JSON on stdin. Not Edition B.",
+        )
+
     sh = sub.add_parser("summarize-hour")
-    sh.add_argument("--bundle", default="")
-    sh.add_argument("--period", required=True, help="hour period, YYYY-MM-DDTHH")
-    sh.add_argument("--author", default="")
-    sh.add_argument("--host", default="claude-code", help="host-switch filter (read-time only)")
-    sh.add_argument(
-        "--model-cmd",
-        dest="model_cmd",
-        default="",
-        help="optional CLI that reads filter-view JSON on stdin and writes {summary,saliency}. Tests stub this. No API key required.",
-    )
+    _add_summarize_flags(sh)
+    sm = sub.add_parser("summarize")
+    _add_summarize_flags(sm)
+
+    ss = sub.add_parser("sessions")
+    ss.add_argument("action", choices=["list", "show"])
+    ss.add_argument("--bundle", default="")
+    ss.add_argument("--period", default="", help="hour period filter for list")
+    ss.add_argument("--id", default="", help="session slug for show")
+    ss.add_argument("--recent", type=int, default=0, help="when listing without --period, last N sessions")
+
+    pc = sub.add_parser("print-cron")
+    pc.add_argument("--bundle", default="")
+    pc.add_argument("--author", default="")
 
     cs = sub.add_parser("close-segment")
     cs.add_argument("--bundle", default="")
@@ -1521,7 +1697,7 @@ def main() -> int:
     wd.add_argument("--seconds", type=int, default=0, help="override global WATCHDOG_SECONDS (default 3600)")
     wd.add_argument("--role", default="", help="rejected: per-role watchdog is phase two")
 
-    args = p.parse_args()
+    args = p.parse_args(argv)
     fn = {
         "init": cmd_init,
         "path-for": cmd_path_for,
@@ -1532,7 +1708,10 @@ def main() -> int:
         "rollup": cmd_rollup,
         "validate": cmd_validate,
         "tick-hour": cmd_tick_hour,
-        "summarize-hour": cmd_summarize_hour,
+        "summarize-hour": cmd_summarize,
+        "summarize": cmd_summarize,
+        "sessions": cmd_sessions,
+        "print-cron": cmd_print_cron,
         "close-segment": cmd_close_segment,
         "prune-telemetry": cmd_prune_telemetry,
         "watchdog": cmd_watchdog,

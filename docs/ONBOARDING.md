@@ -12,6 +12,8 @@ Samples stay **Northstar / Lumenfield** fiction.
 
 Ingest pipeline (each step is its own process):
 
-`ots_tail_jsonl.py` (snapshot) → `tick-hour` → `summarize-hour` → `rollup` → overnight pointers (separate)
+`ots_tail_jsonl.py` (snapshot) → `tick-hour` → `summarize --period` → `rollup` → overnight pointers (separate)
+
+`scripts/ots` is a thin dispatcher (`ots once`, `ots summarize`, `ots sessions list`, `ots print-cron`).
 
 The tailer is read-only on the host JSONL and copies it to `sessions/<slug>.source.jsonl`. No vendor-neutral emit JSONL is stored. No LLM in the tailer. Summarization applies the host-switch filter at read time: [TELEMETRY_EMIT.md](TELEMETRY_EMIT.md). Three planes + snapshot rule: [PRD-TELEMETRY-PHASE1.md](PRD-TELEMETRY-PHASE1.md).

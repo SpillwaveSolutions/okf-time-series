@@ -14,6 +14,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 TAILER = ROOT / "scripts" / "ots_tail_jsonl.py"
 COMMON = ROOT / "scripts" / "ots_common.py"
+OTS = ROOT / "scripts" / "ots"
 FIXTURE = ROOT / "tests" / "fixtures" / "host-session.jsonl"
 
 sys.path.insert(0, str(ROOT / "scripts"))
@@ -415,12 +416,245 @@ class TestSummarizeLeavesSourceUntouched(unittest.TestCase):
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("OPENAI_API_KEY", None)
         s = run_common(
-            ["summarize-hour", "--period", "2026-08-21T14", "--author", "local/tailer"],
+            ["summarize", "--period", "2026-08-21T14", "--author", "local/tailer", "--stub"],
             env=env,
             bundle=str(self.bundle),
         )
         self.assertEqual(s.returncode, 0, s.stdout + s.stderr)
         self.assertTrue(json.loads(s.stdout)["ok"])
+
+    def test_summarize_without_edition_fails_loudly(self):
+        run_tail(
+            [
+                "once",
+                "--jsonl",
+                str(FIXTURE),
+                "--role",
+                "software_engineer",
+                "--agent",
+                "atlas",
+                "--cursor",
+                str(self.cursor),
+                "--author",
+                "local/tailer",
+            ],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        env = dict(self.env)
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("OKF_SUMMARIZE_CMD", None)
+        s = run_common(
+            ["summarize", "--period", "2026-08-21T14", "--author", "local/tailer"],
+            env=env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(s.returncode, 1)
+        self.assertIn("edition", s.stdout.lower())
+        self.assertNotIn("edition b", s.stdout.lower())  # no silent fallback hint as success
+
+    def test_resummarize_leaves_source_hash_unchanged(self):
+        run_tail(
+            [
+                "once",
+                "--jsonl",
+                str(FIXTURE),
+                "--role",
+                "software_engineer",
+                "--agent",
+                "atlas",
+                "--cursor",
+                str(self.cursor),
+                "--author",
+                "local/tailer",
+            ],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        source = list(self.bundle.rglob("software_engineer__atlas__001.source.jsonl"))[0]
+        digest = sha256(source)
+        for _ in range(2):
+            s = run_common(
+                ["summarize", "--period", "2026-08-21T14", "--author", "local/tailer", "--stub"],
+                env=self.env,
+                bundle=str(self.bundle),
+            )
+            self.assertEqual(s.returncode, 0, s.stdout + s.stderr)
+        self.assertEqual(sha256(source), digest)
+
+
+class TestEditionsAndInspect(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.bundle = Path(self.tmp.name) / "bundle"
+        self.bundle.mkdir()
+        self.env = {"SECOND_BRAIN_IDENTITY": "local/tailer"}
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _fake_cli(self, name="claude"):
+        bindir = Path(self.tmp.name) / "bin"
+        bindir.mkdir(exist_ok=True)
+        script = bindir / name
+        script.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = \"--help\" ]; then echo \"Usage: $0 -p --model MODEL\"; exit 0; fi\n"
+            "echo '{\"summary\":\"from host cli\",\"saliency\":\"- edition a\"}'\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return bindir
+
+    def test_setup_edition_a_fails_if_cli_missing(self):
+        env = dict(self.env)
+        env["PATH"] = str(Path(self.tmp.name) / "empty")
+        Path(env["PATH"]).mkdir()
+        r = run_tail(
+            ["setup", "--edition", "a", "--host", "claude-code", "--jsonl", str(FIXTURE), "--role", "software_engineer", "--agent", "local"],
+            env=env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("cli missing", r.stdout.lower())
+
+    def test_setup_edition_a_fails_if_wrong_model(self):
+        env = dict(self.env)
+        env["PATH"] = str(self._fake_cli()) + os.pathsep + env.get("PATH", "")
+        r = run_tail(
+            [
+                "setup",
+                "--edition",
+                "a",
+                "--host",
+                "claude-code",
+                "--model",
+                "gpt-5.6-luna",
+                "--jsonl",
+                str(FIXTURE),
+                "--role",
+                "software_engineer",
+                "--agent",
+                "local",
+            ],
+            env=env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("wrong model", r.stdout.lower())
+
+    def test_setup_edition_a_succeeds_with_pinned_model(self):
+        env = dict(self.env)
+        env["PATH"] = str(self._fake_cli()) + os.pathsep + env.get("PATH", "")
+        r = run_tail(
+            [
+                "setup",
+                "--edition",
+                "a",
+                "--host",
+                "claude-code",
+                "--model",
+                "claude-haiku-4-5",
+                "--jsonl",
+                str(FIXTURE),
+                "--role",
+                "software_engineer",
+                "--agent",
+                "local",
+            ],
+            env=env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cfg = json.loads((self.bundle / "okf/temporal/tailer.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["edition"], "a")
+        self.assertEqual(cfg["model"], "claude-haiku-4-5")
+
+    def test_setup_edition_b_fails_if_key_unset(self):
+        env = dict(self.env)
+        env.pop("ANTHROPIC_API_KEY", None)
+        r = run_tail(
+            ["setup", "--edition", "b", "--host", "claude-code", "--jsonl", str(FIXTURE), "--role", "software_engineer", "--agent", "local"],
+            env=env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("key unset", r.stdout.lower())
+
+    def test_setup_edition_b_succeeds_with_key(self):
+        env = dict(self.env)
+        env["ANTHROPIC_API_KEY"] = "sk-test-not-used"
+        r = run_tail(
+            ["setup", "--edition", "b", "--host", "claude-code", "--jsonl", str(FIXTURE), "--role", "software_engineer", "--agent", "local"],
+            env=env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cfg = json.loads((self.bundle / "okf/temporal/tailer.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["edition"], "b")
+        self.assertEqual(cfg["api_key_env"], "ANTHROPIC_API_KEY")
+        self.assertEqual(cfg["model"], "claude-haiku-4-5")
+
+    def test_sessions_list_and_show_excerpts(self):
+        cursor = Path(self.tmp.name) / "cursor.json"
+        run_tail(
+            [
+                "once",
+                "--jsonl",
+                str(FIXTURE),
+                "--role",
+                "software_engineer",
+                "--agent",
+                "local",
+                "--cursor",
+                str(cursor),
+                "--author",
+                "local/tailer",
+            ],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        run_common(
+            ["summarize", "--period", "2026-08-21T14", "--author", "local/tailer", "--stub"],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        listed = run_common(
+            ["sessions", "list", "--period", "2026-08-21T14"],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(listed.returncode, 0, listed.stdout + listed.stderr)
+        data = json.loads(listed.stdout)
+        self.assertTrue(data["sessions"])
+        rec = data["sessions"][0]
+        self.assertEqual(rec["id"], "software_engineer__local__001")
+        self.assertTrue(rec["source"])
+        self.assertTrue(rec["summary"])
+        self.assertTrue(rec["saliency"])
+        shown = run_common(
+            ["sessions", "show", "--id", "software_engineer__local__001"],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(shown.returncode, 0, shown.stdout + shown.stderr)
+        show = json.loads(shown.stdout)
+        self.assertTrue(show["summary_excerpt"])
+        self.assertTrue(show["saliency_excerpt"])
+        st = run_common(
+            ["summarize", "--status", "--period", "2026-08-21T14"],
+            env=self.env,
+            bundle=str(self.bundle),
+        )
+        self.assertEqual(st.returncode, 0, st.stdout + st.stderr)
+        self.assertIn("software_engineer__local__001", st.stdout)
+
+    def test_print_cron(self):
+        r = run_common(["print-cron", "--bundle", str(self.bundle), "--author", "local/tailer"], env=self.env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("ots_tail_jsonl.py once", r.stdout)
+        self.assertIn("tick-hour", r.stdout)
+        self.assertIn("summarize --period", r.stdout)
 
 
 if __name__ == "__main__":

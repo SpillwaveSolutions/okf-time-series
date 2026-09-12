@@ -29,6 +29,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import ots_common as ots  # noqa: E402
+import ots_editions as editions  # noqa: E402
 import ots_filter as flt  # noqa: E402
 
 HOSTS = flt.HOSTS
@@ -412,20 +413,25 @@ class Tailer:
             if self.once:
                 snap = self.flush()
                 break
-            grew = False
-            if self.source_path and self.source_path.exists():
-                hstat = self.jsonl.stat()
-                dstat = self.source_path.stat()
-                grew = hstat.st_size > dstat.st_size or hstat.st_mtime > dstat.st_mtime
-            else:
-                grew = True
+            # Architect lock: refresh on idle + size/mtime growth. Not every-second mirror.
+            hstat = self.jsonl.stat()
+            dest = self.source_path
+            grew = True
+            if dest is not None and dest.exists():
+                dstat = dest.stat()
+                if hstat.st_size < dstat.st_size:
+                    grew = False
+                else:
+                    grew = hstat.st_size > dstat.st_size or hstat.st_mtime > dstat.st_mtime
             if grew:
-                snap = self.flush()
-            else:
-                snap = {"copied": False, "reason": "unchanged"}
-            if (time.monotonic() - self.last_growth) >= self.idle:
-                self.flush()
                 self.last_growth = time.monotonic()
+                self._pending_growth = True
+            pending = getattr(self, "_pending_growth", False)
+            if pending and (time.monotonic() - self.last_growth) >= self.idle:
+                snap = self.flush()
+                self._pending_growth = False
+            else:
+                snap = {"copied": False, "reason": "waiting_idle" if pending else "unchanged"}
             time.sleep(DEFAULT_POLL)
         return {
             "ok": True,
@@ -442,8 +448,10 @@ class Tailer:
 def merge_runtime_args(args, bundle: Path | None) -> None:
     """Fill missing CLI fields from okf/temporal/tailer.json. No remotes."""
     cfg = load_tailer_config(bundle) if bundle is not None else {}
-    if not getattr(args, "jsonl", "") and cfg.get("jsonl"):
-        args.jsonl = str(cfg["jsonl"])
+    if not getattr(args, "jsonl", "") and (cfg.get("jsonl") or cfg.get("source")):
+        args.jsonl = str(cfg.get("jsonl") or cfg.get("source"))
+    if not getattr(args, "author", "") and cfg.get("identity"):
+        args.author = str(cfg["identity"])
     if not getattr(args, "host", None) or args.host == "claude-code":
         if cfg.get("host"):
             args.host = str(cfg["host"])
@@ -656,21 +664,49 @@ def cmd_setup(args) -> int:
             return fail("missing source", path=jsonl_raw)
         jsonl_raw = str(p.resolve())
     role = (getattr(args, "role", "") or "software_engineer").strip()
-    agent = (getattr(args, "agent", "") or "atlas").strip()
+    agent = (getattr(args, "agent", "") or "local").strip()
     host = getattr(args, "host", "claude-code") or "claude-code"
     n = int(getattr(args, "n", 1) or 1)
     idle = float(getattr(args, "idle", DEFAULT_IDLE) or DEFAULT_IDLE)
     cursor = getattr(args, "cursor", "") or CURSOR_REL.as_posix()
+    identity = (getattr(args, "identity", "") or getattr(args, "author", "") or "local/tailer").strip()
+    edition = (getattr(args, "edition", "") or "").strip().lower()
+    model = (getattr(args, "model", "") or "").strip()
     data = {
         "v": 1,
+        "identity": identity,
         "host": host,
+        "source": jsonl_raw,
         "jsonl": jsonl_raw,
         "role": role,
         "agent": agent,
         "n": n,
+        "idle": idle,
         "idle_seconds": idle,
         "cursor": cursor,
     }
+    if edition:
+        if edition not in {"a", "b"}:
+            return fail("edition must be a or b")
+        try:
+            extra = editions.edition_config_fields(host, edition, identity=identity)
+        except ValueError as exc:
+            return fail(str(exc))
+        if edition == "a":
+            check = editions.verify_edition_a(host, model or extra["model"])
+        else:
+            check = editions.verify_edition_b(
+                host,
+                model=model or extra["model"],
+                provider=getattr(args, "provider", "") or extra.get("provider") or "",
+                api_key_env=getattr(args, "api_key_env", "") or extra.get("api_key_env") or "",
+            )
+        if not check.get("ok"):
+            print(json.dumps(check))
+            return 1
+        data.update(extra)
+        if model:
+            data["model"] = extra["model"]
     dest = write_tailer_config(bundle, data)
     print(json.dumps({"ok": True, "path": str(dest), "config": data}))
     return 0
@@ -686,6 +722,11 @@ def add_common_flags(p: argparse.ArgumentParser, *, require_agent: bool = False)
     p.add_argument("--n", type=int, default=1, help="session ordinal, default 1 → __001")
     p.add_argument("--idle", type=float, default=DEFAULT_IDLE, help="idle flush seconds (default 300)")
     p.add_argument("--cursor", default="", help="cursor file; default okf/temporal/.ots-cursor.json")
+    p.add_argument("--identity", default="", help="process identity written to tailer.json (default local/tailer)")
+    p.add_argument("--edition", default="", choices=["a", "b"], help="summarize edition (setup)")
+    p.add_argument("--model", default="", help="must match the pinned cheapest model for --host")
+    p.add_argument("--provider", default="", help="edition b provider (anthropic|openai|xai)")
+    p.add_argument("--api-key-env", dest="api_key_env", default="", help="edition b key env name")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -43,7 +43,7 @@ python3 scripts/ots_tail_jsonl.py once \
   --bundle "$SECOND_BRAIN_ROOT"
 ```
 
-`ots-tail` also has `start` / `stop` / `status` / `check` / `setup` (`setup` writes `okf/temporal/tailer.json` in the bundle; never a private remote). Pipeline: tail → `tick-hour` → `summarize-hour` → `rollup` → overnight pointers (separate). Phase-1 snapshot rule and the three planes: [docs/PRD-TELEMETRY-PHASE1.md](docs/PRD-TELEMETRY-PHASE1.md). The emit table is a **read-time filter**, not stored: [docs/TELEMETRY_EMIT.md](docs/TELEMETRY_EMIT.md).
+`ots-tail` also has `start` / `stop` / `status` / `check` / `setup` (`setup` writes `okf/temporal/tailer.json`; never a private remote). Pipeline: tail → `tick-hour` → `summarize --period` → `rollup` → overnight pointers (separate). Summarize Edition A (host CLI + pinned cheapest model) or Edition B (API key). Inspect with `ots sessions list` / `show`. Cron helper: `ots print-cron`. Phase-1 snapshot rule: [docs/PRD-TELEMETRY-PHASE1.md](docs/PRD-TELEMETRY-PHASE1.md). Emit table is a **read-time filter**, not stored: [docs/TELEMETRY_EMIT.md](docs/TELEMETRY_EMIT.md).
 
 Milestone segments are hour-aligned. Telemetry retention defaults to 90 days. The watchdog is global, default one hour.
 

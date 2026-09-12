@@ -10,7 +10,7 @@ Fiction only (Northstar / Lumenfield). Spec of record: [okf-plugin#72](https://g
 |-------|---------|--------|-----|
 | **Capture** | `ots_tail_jsonl.py` once/follow/start | `sessions/<slug>.source.jsonl` + session hub + cursor | No |
 | **Tick** | `ots_common.py tick-hour` | Hour node (sparse; skips an open segment) | No |
-| **Summarize** | `ots_common.py summarize-hour` | `.summary.md` / `.saliency.md` | Yes (hour-close Haiku, stubbable) |
+| **Summarize** | `ots summarize --period` | `.summary.md` / `.saliency.md` | Yes (Edition A host CLI or Edition B API; inline) |
 
 Overnight pointer batch is a later plane. Out of scope here.
 
@@ -20,7 +20,7 @@ Overnight pointer batch is a later plane. Out of scope here.
 - Replace the snapshot only when host size/mtime **grew**. Never shrink.
 - **No vendor-neutral stored schema.** Do not normalize Claude / Grok / Codex into a custom emit JSONL as the stored capture.
 - Adapters choose which file to copy and session boundaries only.
-- `.telemetry.md` is optional / deferred in phase 1.
+- `.telemetry.md` is **deferred / omitted** in phase 1. Hub + `.source.jsonl` are required.
 
 ## Session hub
 
@@ -32,10 +32,43 @@ The tailer calls `write-session --ensure-spine` (flag confirmed on for this path
 
 ## Read-time filter
 
-Inference stays at hour-close. Haiku (or `summarize-hour`) reads `.source.jsonl` and applies the host-switch filter — user prompt + final assistant; skip `tool_result`. That view is **not stored**. Contract: [TELEMETRY_EMIT.md](TELEMETRY_EMIT.md).
+Inference stays at hour-close. `ots summarize --period` reads `.source.jsonl` and applies the host-switch filter — user prompt + final assistant; skip `tool_result`. That view is **not stored**. Contract: [TELEMETRY_EMIT.md](TELEMETRY_EMIT.md).
+
+`--follow` refreshes the snapshot on **idle + size/mtime growth** (never shrink). Not an every-second mirror.
+
+## Two summarize editions
+
+Capture and storage are identical. Only the backend differs. Setup fails loudly; there is **no silent fallback** from A to B.
+
+**Edition A — host CLI (no API key).** Wizard pins the cheapest model. Never trust the host default.
+
+| Host | Command |
+|------|---------|
+| Claude Code | `claude -p --model claude-haiku-4-5` |
+| Codex | `codex exec -m gpt-5.6-luna` |
+| Grok Build | `grok --model grok-4-fast -p` |
+
+If the CLI is missing or the model is not the pin, setup and summarize fail.
+
+**Edition B — API key.** Direct HTTP: `ANTHROPIC_API_KEY` → `claude-haiku-4-5`; `OPENAI_API_KEY` → `gpt-5.6-luna`. Wizard refuses without a verified key env + pinned model. Same prompt and output files as A.
+
+`ots summarize` invokes the model **inline**. The scheduler is the user's cron (`ots print-cron` prints suggested lines). Not a hidden queue.
 
 ## Config
 
-`ots-tail setup` writes `okf/temporal/tailer.json` in the **bundle**. Never hard-code a private remote. Bundle root is `SECOND_BRAIN_ROOT`.
+Canonical path: bundle **`okf/temporal/tailer.json`**. Optional machine overlay: `~/.okf/ots-tail.json` (or `OKF_OTS_MACHINE_CONFIG`). Never a private remote. Never `/.okf/ots-tail.toml`.
 
-Idle flush default is 300 seconds. No host hooks. No LLM in the tailer.
+```json
+{
+  "identity": "local/tailer",
+  "host": "claude-code",
+  "source": "/home/you/.claude/projects/northstar/session.jsonl",
+  "idle": 300,
+  "edition": "a",
+  "model": "claude-haiku-4-5"
+}
+```
+
+Edition B adds `provider` and `api_key_env`. Dogfood slug: `software_engineer__local__001`.
+
+Idle flush default is 300 seconds. No host hooks. No LLM in the tailer. `worked_during` is not in this PR.

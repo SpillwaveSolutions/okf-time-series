@@ -6,8 +6,10 @@
 - `ots_tail_jsonl.py` commands: `once` / `follow` / `start` / `stop` / `status` / `check` / `setup`. Cursor is `path`, `pos` or `size`/`mtime`, `session_id`, `updated_at`. Replace snapshot only if size/mtime grew; never shrink. Idle flush default 300s.
 - `write-session --ensure-spine` confirmed for the tailer hub. Same slug across hours; `close-segment` on rollover.
 - `TELEMETRY_EMIT` moved to `docs/TELEMETRY_EMIT.md` as the **read-time** filter for summarization (user prompt + final assistant; skip `tool_result`). Not stored.
-- `summarize-hour` reads the snapshot, applies the filter, writes `.summary.md` / `.saliency.md`, and does not touch `.source.jsonl`. Model call is stubbable (`--model-cmd` / `OKF_SUMMARIZE_CMD`); tests need no API key.
-- Setup writes `okf/temporal/tailer.json` in the bundle. No private remotes. Phase-1 PRD: `docs/PRD-TELEMETRY-PHASE1.md`.
+- `ots summarize --period` reads the snapshot, applies the filter, writes `.summary.md` / `.saliency.md`, and does not touch `.source.jsonl`. Edition A (pinned host CLI) or Edition B (verified API key). No silent fallback. Tests use explicit `--stub` / `--model-cmd`.
+- Setup `--edition a` fails if the host CLI is missing or the model is not the pin; `--edition b` fails if the key env is unset.
+- `ots sessions list|show` and `ots summarize --status` show source/summary/saliency presence and excerpts. `ots print-cron` prints suggested crontab lines (user scheduler; not an in-pack queue).
+- Setup writes `okf/temporal/tailer.json` in the bundle (optional `~/.okf/ots-tail.json` overlay). No private remotes. Phase-1 PRD: `docs/PRD-TELEMETRY-PHASE1.md`. `.telemetry.md` omitted in phase 1.
 
 ## 0.3.1 — 2026-09-12
 

@@ -16,4 +16,4 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ots_common.py" tick-hour \
 
 Pass `--ensure-parents` to create missing Year→Day containers. Default is sparse.
 
-Upstream of the tick: `ots_tail_jsonl.py` (snapshot, no LLM). Downstream: `summarize-hour` (Haiku or stub), then `rollup`. Overnight pointers stay a separate process.
+Upstream of the tick: `ots_tail_jsonl.py` (snapshot, no LLM). Downstream: `ots summarize --period` (Edition A or B, inline), then `rollup`. Overnight pointers stay a separate process. `ots print-cron` prints a crontab that runs once + tick-hour + summarize.
