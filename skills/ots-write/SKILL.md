@@ -15,4 +15,6 @@ Hour nodes come from `tick-hour`, not from session writes. `--ensure-spine` is *
 
 A session that crosses an hour boundary closes its segment and opens the next (`close-segment --period YYYY-MM-DDTHH`), so each segment belongs to exactly one Hour.
 
+Host JSONL is ingested by `ots_tail_jsonl.py` (see `ots-tail`). Pipeline: tail → tick-hour → rollup → Haiku summary (separate) → overnight pointers (separate).
+
 Never write frontmatter by hand. Children before parent aggregates. Do not invent summary prose in `rollup` — the model proposes, the script only links.
