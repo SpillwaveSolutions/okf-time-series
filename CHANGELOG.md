@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.1 — 2026-09-12
+
+- Phase-1 telemetry emit body contract: `schemas/okf-temporal/TELEMETRY_EMIT.md` (`v`, `ts`, `host`, `session_id`, `actor`, `turn`, `role`, `text`). Frontmatter unchanged.
+- Official tailer `scripts/ots_tail_jsonl.py`: read-only host JSONL, skip `tool_result` user lines, idle-flush prompt → final assistant, cursor file for restart-without-duplicate.
+- Tailer calls `write-session --ensure-spine` once and `close-segment` on hour rollover (same session id). No LLM, no Haiku, no pointers.
+- Sample telemetry updated to the locked fence fields. Older `t`/`kind` aliases are not used.
+
 ## 0.3.0 — 2026-09-03
 
 - Hourly tick skips only an Hour containing an **open segment**, not an open session. Closed segments finalize on the normal tick. At most one un-finalized Hour per running session.

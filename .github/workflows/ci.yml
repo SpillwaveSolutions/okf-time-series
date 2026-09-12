@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Unit tests
-        run: python3 tests/test_*.py
+        run: python3 -m unittest discover -s tests -v
       - name: Compile scripts
         run: python3 -m py_compile scripts/*.py
       - name: Validate sample-knowledge

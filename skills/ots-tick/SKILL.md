@@ -15,3 +15,5 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ots_common.py" tick-hour \
 - Re-running over an already-finalized Hour is a no-op.
 
 Pass `--ensure-parents` to create missing Year→Day containers. Default is sparse.
+
+Upstream of the tick: `ots_tail_jsonl.py` (no LLM). Downstream: `rollup`, then Haiku summary and overnight pointers as separate processes.
