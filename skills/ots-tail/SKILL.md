@@ -9,7 +9,8 @@ python3 "${CLAUDE_PLUGIN_ROOT}/scripts/ots_tail_jsonl.py" --once \
   --host claude-code \
   --role software_engineer --agent atlas --n 1 \
   --author "${SECOND_BRAIN_IDENTITY:-local/tailer}" \
-  --bundle "$SECOND_BRAIN_ROOT"
+  --bundle "$SECOND_BRAIN_ROOT" \
+  --cursor /tmp/host-session.ots-cursor.json
 ```
 
 `--follow` is the default long-running mode. `--once` drains to EOF and exits.

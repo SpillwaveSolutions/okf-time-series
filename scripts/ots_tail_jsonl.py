@@ -576,6 +576,7 @@ class Tailer:
     last_activity: float = 0.0
     committed_pos: int = 0
     read_pos: int = 0
+    emitted: int = 0
 
     def setup(self) -> None:
         self.cursor = load_cursor(self.cursor_path)
@@ -641,6 +642,7 @@ class Tailer:
         self.cursor.pos = self.committed_pos
         self.cursor.source_path = self.jsonl.as_posix()
         save_cursor(self.cursor_path, self.cursor)
+        self.emitted += wrote
         return wrote
 
     def _flush_if_complete_pair(self) -> None:
@@ -712,21 +714,20 @@ class Tailer:
     def run(self) -> dict:
         self.setup()
         self.last_activity = time.monotonic()
-        emitted = 0
         while True:
             self.drain()
             if self.once:
-                emitted += self.flush()
+                self.flush()
                 break
             if self.pending.user and self.pending.assistant and (time.monotonic() - self.last_activity) >= self.idle:
-                emitted += self.flush()
+                self.flush()
             time.sleep(DEFAULT_POLL)
         return {
             "ok": True,
             "session": self.slug,
             "telemetry": str(self.telemetry_path) if self.telemetry_path else "",
             "cursor": str(self.cursor_path),
-            "emitted": emitted,
+            "emitted": self.emitted,
             "pos": self.cursor.pos,
         }
 

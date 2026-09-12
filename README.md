@@ -40,7 +40,8 @@ python3 scripts/ots_tail_jsonl.py --once \
   --host claude-code \
   --role software_engineer --agent atlas --n 1 \
   --author "$SECOND_BRAIN_IDENTITY" \
-  --bundle "$SECOND_BRAIN_ROOT"
+  --bundle "$SECOND_BRAIN_ROOT" \
+  --cursor /tmp/ots-bundle/host-session.ots-cursor.json
 ```
 
 Pipeline: tail → `tick-hour` → `rollup` → Haiku summary (separate) → overnight pointers (separate). Body contract: [schemas/okf-temporal/TELEMETRY_EMIT.md](schemas/okf-temporal/TELEMETRY_EMIT.md).

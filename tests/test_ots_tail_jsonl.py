@@ -120,6 +120,7 @@ class TestTailerOnceAndCursor(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         data = json.loads(r.stdout)
         self.assertTrue(data["ok"])
+        self.assertEqual(data["emitted"], 4)
         rows = self._emit_rows()
         self.assertEqual(len(rows), 4)
         self.assertEqual([row["role"] for row in rows], ["user", "assistant", "user", "assistant"])
